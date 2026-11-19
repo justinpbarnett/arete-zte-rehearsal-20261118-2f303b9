@@ -1,0 +1,1265 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from . import (
+    config,
+    diffguard,
+    document,
+    factory,
+    gh,
+    intake,
+    owner_asks,
+    patching,
+    paths,
+    pilot,
+    pipeline,
+    prompt_loader,
+    record,
+    repairs,
+    routing,
+    run_lines,
+    runner,
+    slots,
+    tracker,
+    util,
+    workspace,
+)
+from .agent import NO_SESSION, Result
+from .factory import Outcome
+from .review import Review
+from .store import asks as asks_store
+from .store import runs as run_store
+from .store import triage as triage_store
+from .verify import Verified
+
+TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels")
+BUILD = "build"
+REVIEW_FIX = "review_fix"
+CHECK_REPAIR = "check_repair"
+REVIEW_REPAIR = "review_repair"
+CI_REPAIR = "ci_repair"
+ROLE_OF = {"plan": "plan", "patch": BUILD, "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
+           "document": "document"}
+SETTABLE = {**ROLE_OF, "orchestrate": "orchestrate", CHECK_REPAIR: CHECK_REPAIR,
+            REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
+
+
+def atom_of(name: str, kw: dict) -> str:
+    if name == "repair":
+        return REVIEW_REPAIR
+    if name != "implement":
+        return ROLE_OF.get(name, "")
+    if kw.get("asks"):
+        return CI_REPAIR
+    if str(kw.get("round") or BUILD).startswith(REVIEW_FIX):
+        return REVIEW_REPAIR
+    return BUILD if kw.get("round", BUILD) == BUILD else CHECK_REPAIR
+
+
+def ran_on_seam(run_id: str) -> bool:
+    return any(line.get("event") == "route" or (line.get("event") == "step_start" and line.get("step") == "prepare")
+               for line in run_lines.read(run_id))
+
+
+def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunSlot | None = None,
+          continues: str = "", only: str = "", again: str = "") -> factory.Flow:
+    ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
+    continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
+                              else "")
+    if continues and not only:
+        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
+    job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    refusal = guard(job, continues) if continues else ""
+    renew = ""
+    if refusal:
+        job.note_task()
+    elif continues and not only and kept_pending(job, continues) and (moved := base_moved(continues)):
+        if run.answers_due:
+            job.moved_base = moved
+        else:
+            run.log(f"{moved} since run {continues} prepared, so this run prepares again, keeps the plan and the "
+                    "build when the worktree still holds that run's edits, and runs every later step again")
+            renew = "prepare"
+    return factory.Flow(run.id, job, continues=continues, only=only, again=again, refusal=refusal, renew=renew,
+                        step_runs=list(step_runs(continues).values()) if continues else [])
+
+
+def pending_refusal(job: Job) -> str:
+    source = job.continues if job.only else job.run.id
+    step = " --step pr" if factory.started(job.continues, "pr") else ""
+    harm = ("a prepare run alone would change them outside that chain, which then could not publish them"
+            if job.only else "preparing again would drop them")
+    return (f"{', '.join(job.pending)} holds commits of this run's chain that are not on origin, and {harm}, so arete "
+            "ran no model, reset nothing and left the commits on the branch and in the worktree; "
+            f"`arete resume {source}{step}` publishes them")
+
+
+def kept_pending(job: Job, continues: str) -> bool:
+    if not job.pending:
+        return True
+    try:
+        checkouts = [workspace.Checkout.from_row(e)
+                     for e in prepared_data(continues)["checkouts"]]
+        kept = workspace.kept_onto(job.ws, checkouts, job.branch)
+    except (workspace.RunFailed, RuntimeError, OSError, KeyError, TypeError):
+        return False
+    return all(str(c.wt) in kept for c in checkouts if c.github in job.pending)
+
+
+def guard(job: Job, continues: str) -> str:
+    from .store import orchestration
+
+    if orchestration.publication_pending(continues):
+        return "publication was interrupted; reconcile its branch/PR effects before resuming"
+    if getattr(job.run, "action", "") and (why := action_workspace_refusal(continues)):
+        return why
+    data = prepared_data(continues)
+    branch, listed = str(data.get("branch") or ""), data.get("checkouts")
+    if not continues or not branch or not isinstance(listed, list):
+        return ""
+    job.branch = branch
+    try:
+        checkouts = [workspace.Checkout.from_row(e) for e in listed]
+        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
+        if held := workspace.scratch_held(job.ws, checkouts):
+            return (f"arete started no step and made no tracker call: verification scratch at {held[0]} is still "
+                    "held; poll finalizes it once its holders end, then run again")
+        if why := workspace.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
+            return f"arete started no step and made no tracker call: {why}"
+    except (workspace.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
+        return f"arete started no step and made no tracker call: could not check the worktree: {e}"
+    runs = authors(continues)
+    for c in checkouts:
+        if why := job.reclaim(c, *authority(continues, c, c.lease), runs, attached=c.wt.is_dir()):
+            return why
+    return ""
+
+
+def adaptive_state(run_id: str) -> dict:
+    from .store import orchestration
+
+    return orchestration.find(run_id).get("data", {})
+
+
+def prepared_data(continues: str) -> dict:
+    if prepared := adaptive_state(continues).get("prepared"):
+        return prepared
+    prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
+    return prepared[-1] if prepared else {}
+
+
+def action_workspace_refusal(run_id: str) -> str:
+    checkouts = prepared_data(run_id).get("checkouts") or []
+    if checkouts and all(c.get("wt") and (Path(c["wt"]) / ".git").exists() for c in checkouts):
+        return ""
+    return "adaptive action reruns need retained worktrees; the saved workspace was removed"
+
+
+def base_moved(continues: str) -> str:
+    for c in prepared_data(continues).get("checkouts") or []:
+        if not isinstance(c, dict) or not c.get("base_commit"):
+            continue
+        try:
+            now = workspace.remote_head(Path(c["src"]), c["base"])
+        except RuntimeError:
+            continue
+        if now and now != c["base_commit"]:
+            return f"`origin/{c['base']}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
+    return ""
+
+
+STEP_RUNS_READ = 500
+
+
+def step_runs(run_id: str) -> dict[str, list[dict]]:
+    row, known, found = run_store.run_get(run_id) or {}, factory.chain_runs(run_id), {}
+    if not row:
+        return found
+    for other in reversed(run_store.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
+        if not other.get("only_step") or other["id"] in known:
+            continue
+        read = run_lines.read(other["id"])
+        if str(factory.first(read, "route").get("continues") or "") in known:
+            known.add(other["id"])
+            found[other["id"]] = read
+    return found
+
+
+def authors(run_id: str) -> set[str]:
+    return factory.chain_runs(run_id) | set(step_runs(run_id))
+
+
+def publication(run_id: str) -> dict:
+    if published := adaptive_state(run_id).get("publication"):
+        return published
+    for read in factory.chain(run_id):
+        for line in reversed(factory.ends(read)):
+            data = line.get("data")
+            if line.get("step") == "pr" and line.get("result") == "pass" and isinstance(data, dict):
+                return data
+    return {}
+
+
+def authority(run_id: str, c: workspace.Checkout, lease: str) -> tuple[str, bool]:
+    pub = publication(run_id)
+    heads = pub.get("heads") if isinstance(pub.get("heads"), dict) else {}
+    changed = pub.get("changed") if isinstance(pub.get("changed"), list) else []
+    return str(heads.get(c.github) or lease), c.github in changed
+
+
+def foreign(wt: Path, tip: str, bases: list[str], runs: set[str]) -> list[str]:
+    return [sha for sha, ids in repairs.run_commits(wt, [tip, *(f"^{b}" for b in bases if b)])
+            if sha and not runs & ids]
+
+
+def ancestor(wt: Path, a: str, b: str) -> bool:
+    return util.sh(["git", "merge-base", "--is-ancestor", a, b], cwd=wt).returncode == 0
+
+
+def remade(line: dict) -> tuple[str, list[workspace.Checkout], str]:
+    data = line.get("data") if isinstance(line.get("data"), dict) else {}
+    branch, listed = str(data.get("branch") or ""), data.get("checkouts")
+    if line.get("step") != "prepare" or not branch or not isinstance(listed, list):
+        return branch, [], "only the folder of a prepare step can be made again"
+    made = [workspace.Checkout.from_row(c) for c in listed]
+    try:
+        for c in made:
+            c.lease = workspace.remote_head(c.src, branch)
+            if c.lease:
+                continue
+            if not c.revision:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and no starting revision was recorded")
+            local = util.git(["rev-parse", "--verify", f"refs/heads/{branch}"], c.src, check=False).strip()
+            if c.resumes or c.pr or not local:
+                return branch, made, (f"its branch {branch} is not on origin for {c.github}, "
+                                      "and it was not left unchanged")
+    except RuntimeError as e:
+        return branch, made, f"arete could not look for its branch {branch} on origin: {e}"
+    return branch, made, ""
+
+
+def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> str:
+    branch, made, why = remade(line)
+    if why:
+        return why
+    job.branch = branch
+    leases = {str(e.get("github")): str(e.get("lease") or "") for e in line["data"]["checkouts"]}
+    runs = authors(job.continues)
+    for c in made:
+        if why := job.reclaim(c, *authority(job.continues, c, leases.get(c.github, "")), runs, attached=False):
+            return why
+    ws = Path(line["tree"])
+    admitted = layer is not None
+    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
+    try:
+        workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
+    except workspace.RunFailed as e:
+        return e.why
+    job.run.workspace = ws, made
+    try:
+        for c in made:
+            if c.lease:
+                workspace.fetch(c.src, branch)
+            local = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], c.src, check=False).strip()
+            workspace.add_worktree(c, branch, local or (f"origin/{branch}" if c.lease else c.revision))
+            job.restored[str(c.wt)] = c.lease
+    except RuntimeError as e:
+        return f"arete could not make it again from origin/{branch}: {util.first_line(str(e), 300)}"
+    job.run.log(f"made {ws} again from origin/{branch}")
+    if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
+        return "the restored repository layer changed; reconcile before setup"
+    return pipeline.furnish(job.cfg, job.run, layer, ws)
+
+
+@dataclass
+class Job:
+    cfg: config.Config
+    run: pipeline.Run
+    ws: Path
+    ticket: tracker.Ticket = field(default_factory=lambda: tracker.Ticket("", "", ""))
+    branch: str = ""
+    checkouts: list[workspace.Checkout] = field(default_factory=list)
+    layer: config.RepoLayer = field(default_factory=lambda: config.RepoLayer(dir=Path()))
+    expertise: str = ""
+    attachments: str = ""
+    triage: str = ""
+    plan_text: str = ""
+    goal: str = ""
+    estimate: int = 0
+    left_for_a_person: str = ""
+    build_summary: str = ""
+    verified: Verified = field(default_factory=lambda: Verified("unverified"))
+    review: Review = field(default_factory=lambda: Review.stored({}))
+    fix_reply: str = ""
+    reviews: int = 0
+    built: pipeline.Build | None = None
+    slot: slots.RunSlot | None = None
+    approval: dict | None = None
+    replies: list[dict] = field(default_factory=list)
+    attempts: int = 1
+    report_body: str = ""
+    document: str = ""
+    draft_why: str = ""
+    summary: str = ""
+    opened: list[str] = field(default_factory=list)
+    found: list[str] = field(default_factory=list)
+    pushed: list[str] = field(default_factory=list)
+    drafted: list[str] = field(default_factory=list)
+    ci_stopped: list[str] = field(default_factory=list)
+    changed: list[str] = field(default_factory=list)
+    ci_result: str = ""
+    check_commands: list[str] = field(default_factory=list)
+    check_rules: list[str] = field(default_factory=list)
+    restored: dict[str, str] = field(default_factory=dict)
+    continues: str = ""
+    carried: bool = False
+    committed: bool = True
+    pending: list[str] = field(default_factory=list)
+    only: str = ""
+    noted: bool = False
+    moved_base: str = ""
+    patch_mode: bool = False
+
+    @property
+    def held_reason(self) -> str:
+        if self.verified.verdict == "blocked" and (self.patch_mode or patching.specification_refusal(self.ticket)
+                or patching.sensitive_files(self.layer.patch, self.b.staged.files)):
+            return "the check in use was blocked; this change requires behavioral evidence"
+        return pipeline.draft_reason(self.review, self.verified, self.reviews)
+
+    def merge_moved_base(self, name: str) -> None:
+        moved, self.moved_base = self.moved_base, ""
+        held = [c for c in self.checkouts if c.onto]
+        if moved and held:
+            self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
+                         f"that run kept before {name} runs with the answers")
+            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
+            if merged:
+                self.run.base_note = pipeline.base_merge_note(merged)
+                if self.built is not None:
+                    self.built.workspace = self.workspace
+                workspace.note_made(self.ws, self.checkouts)
+        self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
+
+    @property
+    def with_prs(self) -> list[workspace.Checkout]:
+        return [c for c in self.checkouts if c.pr]
+
+    def picked(self, names: list[str]) -> list[workspace.Checkout]:
+        return [c for c in self.checkouts if c.github in names]
+
+    @property
+    def builder_bash(self) -> list[str]:
+        return self.layer.builder_bash + pipeline.git_reads(self.checkouts) + self.check_rules
+
+    @property
+    def commands(self) -> str:
+        return prompt_loader.code_list(self.layer.builder_bash + pipeline.git_reads(self.checkouts) + self.check_commands)
+
+    @property
+    def checks(self) -> str:
+        return pipeline.check_calls(self.check_commands)
+
+    @property
+    def workspace(self) -> str:
+        return pipeline.workspace_note(self.branch, self.checkouts)
+
+    @property
+    def brief(self) -> prompt_loader.Brief:
+        t = self.ticket
+        return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
+                                   owner=self.run.owner_note, comments=t.comments, attachments=self.attachments,
+                                   expertise=self.expertise, commands=self.commands, max_lines=self.layer.max_diff_lines)
+
+    @property
+    def b(self) -> pipeline.Build:
+        if self.built is None:
+            self.built = pipeline.Build(
+                cfg=self.cfg, run=self.run, ticket=self.ticket, ws=self.ws, checkouts=self.checkouts, layer=self.layer,
+                timeout=self.layer.timeout_minutes * 60, workspace=self.workspace, attachments=self.attachments,
+                tools=prompt_loader.bash_rules(self.builder_bash), deny=diffguard.denied_paths(self.layer),
+                left_for_a_person=self.left_for_a_person, check_commands=self.checks,
+                from_base=self.run.alone or bool(self.run.repairs) or self.carried, plan_text=self.plan_text, build_summary=self.build_summary)
+        return self.built
+
+    def staged(self) -> pipeline.Build:
+        if self.b.staged.empty:
+            self.b.restage()
+        return self.b
+
+    def restore(self, line: dict, *, layer: config.RepoLayer | None = None) -> str:
+        why = rebuild(self, line, layer=layer)
+        if why and not self.only and line.get("step") == "prepare":
+            raise workspace.RunFailed(why)
+        return why
+
+    def policy(self, name: str, kw: dict) -> str:
+        if name == "checks":
+            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
+                     self.layer.targeted_commands, bool(kw.get("quick")))
+        elif name == "verify":
+            value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
+        else:
+            return ""
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+    def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
+            self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
+            return False
+        return True
+
+    def keeps(self, name: str, kw: dict) -> bool:
+        return any(c.onto for c in self.checkouts) and (
+            name in ("plan", "patch", "revise", "repair") or name == "implement" and kw.get("round") == BUILD)
+
+    def labels(self, name: str, kw: dict | None = None) -> dict:
+        atom = atom_of(name, kw or {})
+        if not atom:
+            return {}
+        s = self.run.settings(atom)
+        return {"runner": s.runner, "model": s.model, "effort": s.effort, "tier": s.tier, "kind": self.run.kind,
+                "env": runner.env_names(s.model, s.runner, self.cfg, self.run.repo, self.run.id), "atom": s.step}
+
+    def with_left(self, text: str) -> str:
+        if not self.left_for_a_person:
+            return text
+        return f"{text}\n\n{pipeline.NOT_CHECKED_LEFT_FOR_A_PERSON}{self.left_for_a_person}"
+
+    def take(self, name: str, outcome: Outcome, stored: bool) -> None:
+        data, run = outcome.data, self.run
+        if name == "prepare" and not stored:
+            for ask in run.answers_due:
+                ask["session"] = {}
+        if outcome.passed or name == "review":
+            run.facts.update(pipeline.facts(name, data))
+        if "story" in data:
+            run.story = list(data["story"])
+        if name == "prepare" and outcome.passed:
+            self.prepared(data, stored)
+        elif name in ("plan", "patch") and outcome.passed:
+            self.patch_mode = name == "patch" and not data.get("escalate")
+            self.plan_text, self.goal, self.estimate = data["plan"], data["goal"], data["estimate"]
+            self.left_for_a_person = data["left_for_a_person"]
+            if name == "patch":
+                self.build_summary = data.get("summary", "")
+                if outcome.session.id:
+                    run.sessions[BUILD] = outcome.session
+            if self.built is not None:
+                self.built.plan_text = self.plan_text
+                self.built.build_summary = self.build_summary
+        elif name in ("revise", "repair") and outcome.passed:
+            self.plan_text, self.goal, self.estimate = data["plan"], data["goal"], 0
+            self.left_for_a_person, self.build_summary, self.replies = (data["left_for_a_person"], data["summary"],
+                                                                        data.get("replies", []))
+            if outcome.session.id:
+                run.sessions[BUILD] = outcome.session
+        elif name == "implement":
+            self.build_summary = data.get("summary", self.build_summary)
+            if str(data.get("round") or "").startswith(REVIEW_FIX):
+                self.fix_reply = str(data.get("reply") or "")
+            if outcome.session.id:
+                run.sessions[BUILD] = outcome.session
+        elif name == "checks":
+            self.b.report = data.get("report", self.b.report)
+            if not outcome.passed:
+                self.b.checked = {}
+            elif "checked" in data:
+                self.b.checked = data["checked"]
+            elif data.get("full"):
+                self.b.checked = {"tree": str(data.get("checked_tree") or ""), "commands": data.get("commands", {}),
+                                  "report": data["report"]}
+            if "attempts" in data and not data.get("after"):
+                self.attempts = data["attempts"]
+                if stored:
+                    record.note(run.id, attempts=self.attempts)
+        elif name == "verify" and outcome.passed:
+            self.verified = Verified.stored(data["verified"])
+            if "checked" in data:
+                self.b.checked = data["checked"]
+            self.b.steps = Counter(data["names"])
+        elif name == "review" and "review" in data:
+            self.review, self.reviews = Review.stored(data["review"]), data.get("attempt", 0)
+        elif name == "document" and outcome.passed:
+            self.document = data.get("text", "")
+        elif name == "pr" and outcome.passed:
+            self.published(data, stored)
+        elif name == "ci" and outcome.passed:
+            self.ci_result = data["summary"]
+
+    def published(self, data: dict, stored: bool) -> None:
+        for c in self.checkouts:
+            c.pr = data["prs"].get(c.github, c.pr)
+        self.opened, self.pushed, self.changed = data["opened"], data["pushed"], data["changed"]
+        self.drafted, self.ci_stopped = data.get("drafted", []), data.get("ci_stopped", data["changed"])
+        self.found = data.get("found", [])
+        self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
+        self.b.committed_lines = data["committed_lines"]
+        self.committed = bool(data.get("committed", True))
+        if stored:
+            for c in self.picked(self.changed):
+                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+            if self.with_prs:
+                pipeline.note_prs(self.run, self.branch, self.with_prs)
+
+    def hold(self, name: str) -> str:
+        if name != "prepare" or not self.pending or not self.only and kept_pending(self, self.continues):
+            return ""
+        self.note_task()
+        return pending_refusal(self)
+
+    def note_task(self) -> None:
+        data = prepared_data(self.continues)
+        if self.noted or not isinstance(data.get("ticket"), dict):
+            return
+        self.noted = True
+        opened(self.run, tracker.Ticket(**data["ticket"]))
+
+    def reclaim(self, c: workspace.Checkout, expected: str, published: bool, runs: set[str],
+                attached: bool = True) -> str:
+        branch, remote, head = self.branch, "", ""
+        here = c.wt if attached else c.src
+        try:
+            if attached:
+                on = util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip()
+                if on != f"refs/heads/{branch}":
+                    where = f"branch {on.removeprefix('refs/heads/')}" if on else "a detached HEAD"
+                    return (f"the worktree of {c.github} is on {where}, not {branch}, so arete ran no model and "
+                            f"published nothing; check out {branch} there or remove the worktree, then continue again")
+            remote = workspace.remote_head(c.src, branch)
+            if remote:
+                workspace.fetch(c.src, branch)
+                if util.sh(["git", "cat-file", "-e", f"{remote}^{{commit}}"], cwd=here).returncode:
+                    return f"{branch} of {c.github} moved while arete checked it, so arete ran no model and published nothing"
+            if attached:
+                head = util.git(["rev-parse", "HEAD"], c.wt).strip()
+            else:
+                head = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], c.src, check=False).strip() or remote
+            if (expected or published) and not remote:
+                return f"{branch} is gone from origin for {c.github}, so arete ran no model and published nothing"
+            if remote:
+                if expected and not ancestor(here, expected, remote):
+                    return (f"origin/{branch} of {c.github} no longer contains {expected[:12]}, so arete ran no model, "
+                            "adopted nothing and left both as they are")
+                if others := foreign(here, remote, [expected, c.revision], runs):
+                    return (f"origin/{branch} of {c.github} moved to {remote[:12]} with commits this run's chain did "
+                            f"not make ({', '.join(o[:12] for o in others)}), so arete ran no model, adopted nothing "
+                            "and left both as they are")
+                if not ancestor(here, remote, head):
+                    return (f"{branch} in the worktree of {c.github} does not contain origin/{branch} at {remote[:12]}, "
+                            "so arete ran no model and left both as they are")
+            if others := foreign(here, head, [remote, c.revision], runs):
+                return (f"the worktree's {branch} of {c.github} holds commits that are not on origin and were not made "
+                        f"by this run's chain ({', '.join(o[:12] for o in others)}), so arete ran no model and "
+                        "published nothing")
+        except RuntimeError as e:
+            return f"arete could not check {branch} of {c.github} against origin: {util.first_line(str(e), 300)}"
+        c.lease = remote
+        if head != c.revision:
+            self.carried = True
+        if head not in (remote, c.revision) and c.github not in self.pending:
+            self.pending.append(c.github)
+        return ""
+
+    def prepared(self, data: dict, stored: bool) -> None:
+        run = self.run
+        self.ticket = tracker.Ticket(**data["ticket"])
+        self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
+        self.expertise, self.approval = data["expertise"], data.get("approval")
+        self.checkouts = [workspace.Checkout.from_row(c)
+                          for c in data["checkouts"]]
+        leases = {c.github: c.lease for c in self.checkouts}
+        for c in self.checkouts:
+            if str(c.wt) in self.restored:
+                c.lease = self.restored[str(c.wt)]
+        self.layer = pipeline.checked_layer(self.cfg, Path(data["layer"]))
+        self.check_commands, self.check_rules = pipeline.check_script(run.dir, self.layer, self.ws)
+        run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
+        run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
+        if stored and not run.workspace:
+            if held := workspace.scratch_held(self.ws, self.checkouts):
+                raise workspace.RunFailed(f"verification scratch at {held[0]} is still held; poll finalizes it once "
+                                         "its holders end, then run again")
+            kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
+            if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
+                raise workspace.RunFailed(why)
+            for c in self.checkouts:
+                c.onto = kept.get(str(c.wt), "")
+        elif stored:
+            for c in self.checkouts:
+                c.onto = ""
+        run.workspace = self.ws, self.checkouts
+        if stored:
+            runs = authors(self.continues)
+            for c in self.checkouts:
+                if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
+                    raise workspace.RunFailed(why)
+            opened(run, self.ticket)
+            if not run.alone:
+                run.enter("running")
+
+
+def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
+    run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=run.repo.name, title=t.title,
+                **({"path": run.path} if run.path else {}))
+    if run.answers_due:
+        for ask in run.answers_due:
+            run_lines.write(run.id, "answer", asked_in=ask["run"], ask_id=ask["id"], step=ask["step"],
+                        answers=ask["answers"])
+    elif run.answering:
+        run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
+                    text=pipeline.answer_text(run.answering["id"]))
+
+
+def end_as(result: str, kind: str, **fields) -> Outcome:
+    return Outcome(result, feedback=fields.get("why") or fields.get("summary") or "", data={"ending": kind, **fields})
+
+
+def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies: list[str]) -> list[workspace.Checkout]:
+    repo = run.repo
+    checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir,
+                                   base or util.origin_default_branch(repo.path / p.dir))
+                 for p in repo.parts or [config.Part("", repo.name)]]
+    kept = workspace.kept_or_cleared(ws, checkouts, repo.path, copies, branch)
+
+    def resumes_for(c: workspace.Checkout) -> bool:
+        c.lease = workspace.remote_head(c.src, branch)
+        return bool(c.lease)
+
+    workspace.place_checkouts(run.id, checkouts, kept, branch, resumes_for)
+    return checkouts
+
+
+@factory.step("prepare")
+def prepare(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    cfg, run = job.cfg, job.run
+    repo, tk = run.repo, run.tracker
+    try:
+        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+    except tracker.ERRORS as e:
+        return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
+    opened(run, t)
+    mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
+    if run.feedback or run.repairs:
+        urls = run.feedback_prs or str(mended.get("pr_url") or "").split()
+        if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
+            return end_as("stop", "quiet", status="noop",
+                          summary=f"the PR closed before arete could {'revise' if run.feedback else 'repair'} it: "
+                                  f"{', '.join(closed)}")
+    elif not t.open:
+        return end_as("stop", "quiet", status="noop", summary="ticket is not open")
+    elif t.blocker and not run.force:
+        return end_as("stop", "quiet", status="skipped", summary=t.blocker)
+    try:
+        images = tk.save_images(t, run.dir / "images")
+    except tracker.ERRORS as e:
+        return end_as("stop", "quiet", status="failed", summary=f"could not download the images on {run.ref}: {e}")
+    if images.paths:
+        run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
+    if images.left_out:
+        run.log(f"images: left out {', '.join(images.left_out)}")
+    main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
+    branch = (mended.get("branch") or pipeline.open_branch(run)
+              or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
+                                        slug=prompt_loader.slug(t.title)))
+    if not run.dry_run:
+        tk.prepare()
+    if not run.alone:
+        run.enter("running")
+    try:
+        if repo.parts and not run.dry_run:
+            checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid,
+                                                main_layer.copy)[1]
+        else:
+            checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
+        run.workspace = job.ws, checkouts
+        for c in checkouts:
+            run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
+        run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
+        pipeline.settle_starts(run, checkouts, main_layer, t, branch)
+    except workspace.RunFailed as e:
+        return end_as("fail", "failed", why=e.why, detail=e.detail)
+    for c in checkouts:
+        c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
+    layer = pipeline.resolve_layer(cfg, run, job.ws)
+    if why := pipeline.furnish(cfg, run, layer, job.ws):
+        return end_as("fail", "failed", why=why)
+    workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
+    approval = triage_store.triage_approval(run.triage_key)
+    return Outcome("pass", data={
+        "ticket": {k: getattr(t, k) for k in TICKET_FIELDS}, "branch": branch,
+        "checkouts": [c.to_row() for c in checkouts],
+        "layer": str(layer.dir), "add_dirs": [str(run.dir / "images")] if images.paths else [],
+        "attachments": pipeline.images_note(images), "triage": pipeline.triage_notes(approval), "approval": approval,
+        "expertise": layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"})
+
+
+@factory.step("plan")
+def plan(flow: factory.Flow) -> Outcome:
+    job: Job = flow.ctx
+    run, layer = job.run, job.layer
+    limit, info = layer.max_diff_lines, run.tracker.label_name("needs-info")
+    reads = pipeline.git_reads(job.checkouts)
+    res = run.agent("plan", job.brief.prompt(
+        "plan", triage=job.triage, denied=prompt_loader.code_list(diffguard.denied_paths(layer)),
+        checks=pipeline.check_list(layer)),
+                    job.ws, role="plan", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
+                    json_schema=pipeline.PLAN_SCHEMA)
+    if not res.ok or not isinstance(res.structured, dict):
+        return end_as("fail", "failed", why="planning step failed")
+    found = res.structured
+    plan_text = found.get("plan", "")
+    run.save("plan.md", plan_text)
+    estimate = int(found.get("estimated_lines") or 0)
+    if found.get("ambiguous") and found.get("question"):
+        run.log("plan: ambiguous, asking the author")
+        raise run.owner_ask("plan", [owner_asks.text_ask(str(found["question"]))], res.session)
+    if estimate > limit:
+        split = [s for s in found.get("split") or [] if isinstance(s, dict) and s.get("title")]
+        run.log(f"plan: about {estimate} lines, over the {limit} line limit; proposing a {len(split)} part split")
+        run.save("split.json", split)
+        return end_as("ask", "ask", summary=f"plan estimates {estimate} lines, over the {limit} line limit; split proposed",
+                      comment=pipeline.split_comment(estimate, limit, split, run.tracker.queue_hint, info,
+                                                     layer.config_file))
+    return Outcome("pass", data={
+        "plan": plan_text, "estimate": estimate,
+        "goal": pipeline.triage_goal(
+            found.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.", job.approval),
+        "left_for_a_person": pipeline.left_section(run, (found.get("left_for_a_person") or "").strip()),
+        "assumptions": pipeline.assumptions_of(found)})
+
+
+@factory.step("patch")
+def patch(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    policy = job.layer.patch
+    res = job.run.agent(BUILD, job.brief.prompt(
+        "patch", triage=job.triage, patch_files=policy.max_files, patch_lines=min(policy.max_lines, job.layer.max_diff_lines),
+        denied=prompt_loader.code_list(diffguard.denied_paths(job.layer))), job.ws, role=BUILD,
+        allowed_tools=prompt_loader.bash_rules(job.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
+        json_schema=patching.SCHEMA)
+    if not res.ok or not isinstance(res.structured, dict):
+        return end_as("fail", "failed", why="patch step failed", said=res.text)
+    said = res.structured
+    staged = pipeline.stage(job.checkouts, diffguard.denied_paths(job.layer))
+    why = (str(said.get("reason") or "the builder requested a full plan") if said.get("needs_feature") else
+           patching.change_refusal(policy, staged.files, staged.lines))
+    if not why and staged.empty:
+        return end_as("stop", "nothing", summary=str(said.get("summary") or "No patch was needed."))
+    if why:
+        job.run.log(f"patch: escalating to the feature flow: {why}")
+    return Outcome("pass", data={
+        "plan": str(said.get("plan") or "Implement the repair specified by the issue."),
+        "goal": pipeline.triage_goal(
+            str(said.get("verify") or "Check the issue's acceptance criteria and one nearby behavior."), job.approval),
+        "estimate": min(policy.max_lines, job.layer.max_diff_lines), "left_for_a_person": "",
+        "summary": str(said.get("summary") or res.text), "escalate": why,
+    }, session=job.run.sessions.get(BUILD, NO_SESSION))
+
+
+@factory.step("revise")
+def revision(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    run, layer = job.run, job.layer
+    feedback = pipeline.feedback_markdown(run.feedback)
+    left = pipeline.left_on_prs(run.feedback_prs)
+    run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
+    res = run.agent("revise", job.brief.prompt("revise", feedback=feedback, checks=job.checks),
+                    job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
+                    disallowed_tools=routing.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
+    if not res.ok or not isinstance(res.structured, dict):
+        return end_as("fail", "failed", why="revise step failed", said=res.text)
+    summary, replies = res.structured.get("summary", ""), res.structured.get("replies") or []
+    if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
+        return end_as("stop", "unchanged", summary=summary, replies=replies)
+    return Outcome("pass", data={
+        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
+                 + feedback),
+        "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
+
+
+@factory.step("repair")
+def repair(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    run, layer = job.run, job.layer
+    if not run.repairs:
+        return end_as("fail", "failed", why="this run names no run to repair; start it with arete repair RUN")
+    try:
+        found = repairs.source(run_store.run_get(run.repairs) or {})
+        targets = [c for c in job.checkouts if c.pr in found.prs]
+        if missing := [url for url in found.prs if url not in {c.pr for c in targets}]:
+            raise repairs.Refused(f"{', '.join(missing)} is not an open PR of this run's checkouts")
+        heads = {c.github: repairs.matched_head(c.wt, c.lease, found) for c in targets}
+    except repairs.Refused as e:
+        return end_as("fail", "failed", why=str(e))
+    moved = [c.github for c in targets if heads[c.github] != c.lease]
+    findings = found.review.findings()
+    count = len(found.review.problems)
+    run.log(f"repair: run {found.run_id}, {found.evidence}, {util.count(count, 'finding')}")
+    for github in moved:
+        run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
+                "again on it")
+    run.story.append(f"Review findings of run {found.run_id} to repair:\n{findings}")
+    res = run.agent("repair", job.brief.prompt(
+        "repair", plan=found.plan, source=found.run_id, findings=findings, checks=job.checks),
+                    job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
+                    disallowed_tools=routing.NO_GIT_WRITES)
+    if not res.ok:
+        return end_as("fail", "failed", why="repair step failed", said=res.text)
+    if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
+        return end_as("fail", "failed", said=res.text,
+                      why=f"the builder changed nothing for the findings of run {found.run_id}, so they stay "
+                          "unresolved")
+    return Outcome("pass", data={
+        "plan": found.plan, "left_for_a_person": found.left_for_a_person, "summary": res.text,
+        "goal": f"{found.goal}\n\nAlso check that each of these review findings is fixed:\n\n{findings}",
+        "source": found.run_id, "evidence": found.evidence, "findings": count, "heads": heads, "moved": moved,
+        "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
+
+
+@factory.step("implement")
+def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", attempt: int = 1,
+              tries: int = 1, asks: str = "") -> Outcome:
+    job: Job = flow.ctx
+    run = job.run
+    atom = atom_of("implement", {"round": round, "asks": asks})
+    if asks:
+        res = job.b.resume(round, asks, role=atom, json_schema=pipeline.CI_FIX_SCHEMA)
+        return Outcome("pass" if res.ok and isinstance(res.structured, dict) else "fail",
+                       data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
+                       session=run.sessions.get(BUILD, NO_SESSION))
+    if round.startswith(REVIEW_FIX):
+        res = job.b.resume(round, prompt_loader.prompt(REVIEW_FIX, problems=feedback, notes=job.review.fix_notes()),
+                           role=atom)
+    elif round != BUILD:
+        res = job.b.resume(round, prompt_loader.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
+                                                  checks=job.b.check_commands), role=atom)
+    else:
+        return build(job)
+    return Outcome("pass" if res.ok else "fail", data={"round": round, "reply": res.text},
+                   session=run.sessions.get(BUILD, NO_SESSION))
+
+
+def build(job: Job) -> Outcome:
+    run, layer = job.run, job.layer
+    res = run.agent(BUILD, job.brief.prompt(
+        BUILD, plan=job.plan_text, checks=job.checks, estimate=job.estimate, verify=job.goal),
+                    job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
+                    disallowed_tools=routing.NO_GIT_WRITES)
+    if not res.ok:
+        return end_as("fail", "failed", why="build step failed", said=res.text)
+    if not pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).files:
+        if job.estimate == 0:
+            return end_as("stop", "nothing", summary=res.text)
+        return end_as("fail", "failed", said=res.text,
+                      why=f"the builder stopped without changing anything, though the plan estimated "
+                          f"{util.count(job.estimate, 'line')}")
+    return Outcome("pass", data={"round": BUILD, "summary": res.text},
+                   session=run.sessions.get(BUILD, NO_SESSION))
+
+
+@factory.step("checks")
+def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, after: str = "",
+           quick: bool = False) -> Outcome:
+    job: Job = flow.ctx
+    run, b = job.run, job.b
+    ok = b.check(quick=True) if quick else b.check()
+    if not after:
+        record.note(run.id, attempts=attempt)
+    if not ok:
+        if not after:
+            run.story.append(f"Checks failed on attempt {attempt}:\n{util.tail(b.report, 2500)}" if attempt < tries
+                             else "Checks still failing after the last attempt.")
+        return Outcome("fail", next="implement", feedback=b.report,
+                       data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
+                             "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
+    planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
+    b.require_valid_diff(after or "the build and its fixes", planned)
+    checked_tree = factory.fingerprint(job.ws)
+    full = (b.checked.get("tree") == checked_tree and b.checked.get("commands") == job.layer.checks
+            and b.checked.get("report") == b.report)
+    return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
+                                 "full": full, "checked_tree": checked_tree,
+                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick}),
+                                 "checked": b.checked})
+
+
+@factory.step("verify")
+def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
+    job: Job = flow.ctx
+    b = job.staged()
+    if single and "refactor" in job.ticket.labels:
+        verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
+    elif single and not job.layer.verify:
+        verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
+    else:
+        check = pipeline.check_in_use if single else pipeline.verify_in_use
+        verified = check(b, job.with_left(job.goal), job.build_summary)
+    return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
+                                 "policy": job.policy("verify", {}), "checked": b.checked})
+
+
+@factory.step("review")
+def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: int = 0) -> Outcome:
+    job: Job = flow.ctx
+    run = job.run
+    attempt = 2 if second else attempt
+    said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified,
+                            pipeline.round_name("review", attempt), job.review if attempt > 1 else None,
+                            job.fix_reply)
+    data = {"review": said.asdict(), "attempt": attempt, "story": run.story}
+    if said.verdict != "request_changes":
+        return Outcome("pass", data=data)
+    problems = said.findings()
+    last = second or bool(tries and attempt >= tries)
+    run.story.append(f"Review still requested changes after {util.count(attempt, 'review')}, the limit:\n{problems}"
+                     if last else f"Review requested changes:\n{problems}")
+    return Outcome("fail", next="" if last else "implement", feedback=problems, data=data)
+
+
+@factory.step("learn")
+def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
+    job: Job = flow.ctx
+    commit = pipeline._learn(job.run, job.ws, job.layer.expertise_file, job.ticket.title, apply=apply)
+    return Outcome("pass", data={"applied": apply, "commit": commit})
+
+
+def documents(job: Job) -> bool:
+    return config.document_for(job.cfg, job.run.repo, job.layer).enabled
+
+
+@factory.step("document")
+def write_document(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    staged = job.staged().staged
+    size = pipeline.change_size(staged)
+    text = document.pr_text(job.run, job.ticket, pipeline.summary_of(job.review, job.build_summary), job.review,
+                            job.verified, size, job.held_reason,
+                            job.cfg, job.layer)
+    return Outcome("pass", data={"text": text})
+
+
+def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.Staged, str, str]:
+    staged = job.b.restage() if staged is None else staged
+    if staged.empty:
+        raise workspace.RunFailed("nothing was left to push, since the workspace holds no change")
+    size = pipeline.change_size(staged)
+    return staged, size, f"{size}, review {job.review.verdict}, in use {job.verified.verdict}"
+
+
+def publishing(run: pipeline.Run, branch: str, push: Callable[[], None]) -> None:
+    try:
+        push()
+    except workspace.RunFailed as e:
+        if pilot.is_pilot_task(str(run.tid)):
+            raise workspace.RunFailed(e.why, f"{e.detail}\n\nInspect the pilot receipt and this run's branch. "
+                                            "This authorization cannot be resumed.") from e
+        raise workspace.RunFailed(
+            e.why, f"{e.detail}\n\nThis run's commit stays on `{branch}` in its worktree and nothing on origin was "
+                   f"overwritten. `arete resume {run.id}` publishes it from the pr step when origin still holds only "
+                   "this run's own commits, and refuses otherwise.") from e
+
+
+def adopt_open_prs(job: Job) -> list[workspace.Checkout]:
+    found = []
+    for c in job.checkouts if job.run.repo.parts else []:
+        if not c.pr and (url := gh.open_pr_url(c.github, job.branch)):
+            c.pr = url
+            found.append(c)
+            job.run.log(f"found open {c.pr}, opened by an earlier try of this step")
+    return found
+
+
+def refuse_changed_prs(job: Job) -> None:
+    run = job.run
+    reason = f"the repair of run {run.repairs}" if run.repairs else "PR feedback"
+    for c in job.with_prs if run.repairs or run.feedback else []:
+        view = gh.pr_view(c.pr)
+        if view.get("state") != "OPEN":
+            raise workspace.RunFailed(f"{c.pr} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
+                                     f"nothing for {reason}")
+        if view.get("headRefName") != job.branch:
+            raise workspace.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
+                                     f"pushed nothing for {reason}")
+
+
+def settle_unpushed_checkouts(job: Job, before_push=None):
+    b, run = job.b, job.run
+    fresh = b.restage(from_base=False)
+    staged = b.restage(from_base=True) if fresh.empty or b.from_base else fresh
+    staged, size, outcome = change(job, staged)
+    unpushed = []
+    for c in [c for c in staged.changed if c not in fresh.changed]:
+        head = util.git(["rev-parse", "HEAD"], c.wt).strip()
+        remote = workspace.remote_head(c.src, job.branch)
+        if remote == head:
+            c.lease = head
+        elif remote == c.lease and (not remote or ancestor(c.wt, remote, head)):
+            unpushed.append(c)
+        else:
+            raise workspace.RunFailed(f"nothing was left to push in {c.github}, and its checkout of "
+                                     f"{job.branch} does not match origin")
+    if unpushed:
+        publishing(run, job.branch, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, "",
+                                                                     before_push=before_push))
+    return fresh, staged, size, outcome, unpushed
+
+
+def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
+    b, run, t = job.b, job.run, job.ticket
+    if fresh.empty:
+        b.committed_lines = max(b.committed_lines, staged.lines)
+    committed = not fresh.empty or bool(unpushed)
+    subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    draft_why = job.held_reason
+    revised = ("Revised for the review feedback on the PR.\n\n" if run.feedback else
+               f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")
+    if not fresh.empty:
+        b.staged = fresh
+        publishing(run, job.branch, lambda: b.push(
+            job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}", before_push=before_push))
+        b.staged = staged
+    return subject, draft_why, committed
+
+
+def publication_outcome(job: Job, staged, summary, committed, draft_why="", report_body="", opened=(), pushed=(),
+                        found=(), drafted=(), ci_stopped=()) -> Outcome:
+    data = {"summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
+            "opened": [c.github for c in opened], "pushed": [c.github for c in pushed], "draft_why": draft_why,
+            "changed": [c.github for c in staged.changed], "report_body": report_body,
+            "committed_lines": job.b.committed_lines, "heads": {c.github: c.lease for c in staged.changed},
+            "committed": committed}
+    if job.run.repo.parts:
+        data.update(found=[c.github for c in found], drafted=[c.github for c in drafted],
+                    ci_stopped=[c.github for c in ci_stopped])
+    return Outcome("pass", data=data)
+
+
+def report(job: Job, size: str, images: dict, held: str) -> str:
+    return pipeline.report_body(job.run, summary=job.build_summary, review=job.review, verified=job.verified,
+                                left=job.left_for_a_person, images=images, approval=job.approval, attempts=job.attempts,
+                                checks=pipeline.check_list(job.layer), plan_text=job.plan_text, size=size,
+                                held=held, written=job.document)
+
+
+def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
+                        before_push=None) -> Outcome:
+    run, t, tk = job.run, job.ticket, job.run.tracker
+    images = pipeline.evidence_images(run, staged.changed[0], job.verified)
+    report_body = report(job, size, images, draft_why)
+    link = tk.pr_link(t, whole=not job.left_for_a_person)
+    opened = [c for c in found if c in staged.changed]
+    found = list(opened)
+    stops = {c.github: pipeline.ci.stopped_section(gh.pr_body(c.pr)) for c in found}
+    for c in staged.changed:
+        if c in opened:
+            gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
+        elif not c.pr:
+            if before_push:
+                remote_head = workspace.remote_head(c.src, job.branch)
+                if not remote_head or remote_head != c.lease or c.lease != before_push(c):
+                    raise workspace.RunFailed("the authorized pilot branch changed before PR creation")
+            c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), report_body,
+                                labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
+            opened.append(c)
+            pipeline.note_prs(run, job.branch, job.with_prs)
+            if before_push and gh.pr_draft_and_head(c.pr)[1] != c.lease:
+                raise workspace.RunFailed("GitHub created a PR with a different head; inspect it before any merge")
+            run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
+        else:
+            run.log(f"pushed to {c.pr}" if committed else f"checked {c.pr} again, nothing new to push")
+    standing = [c for c in staged.changed if c not in opened]
+    pushed = standing if committed else []
+    with_prs = job.with_prs
+    pipeline.note_prs(run, job.branch, with_prs)
+    ci_stopped = [c for c in found if stops[c.github]]
+    ci_stopped += pipeline.sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report_body,
+                                         job.left_for_a_person, link, stops, committed)
+    drafted = pipeline.hold_pushed(run, standing + found, ci_stopped, draft_why)
+    return publication_outcome(job, staged, outcome, committed, draft_why, report_body, opened, pushed,
+                               found, drafted, ci_stopped)
+
+
+@factory.step("pr")
+def pr(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    run = job.run
+    run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
+    found = adopt_open_prs(job)
+    refuse_changed_prs(job)
+    before_push = None
+    if pilot.is_pilot_task(str(run.tid)):
+        if (len(job.checkouts) != 1 or run.feedback or run.repairs or found
+                or any(c.resumes or c.lease or c.pr for c in job.checkouts)
+                or not job.branch.startswith(f"arete/{run.tid}-")):
+            raise workspace.RunFailed("the pilot can only publish a fresh branch for this local task")
+
+        def before_push(checkout):
+            try:
+                return pilot.publication_head(run.repo, str(run.tid), run.id, checkout)
+            except pilot.Held as error:
+                raise workspace.RunFailed(str(error)) from error
+
+    fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job, before_push)
+    subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push)
+    if not job.run.repo.parts:
+        record.note(job.run.id, branch=job.branch)
+        if draft_why:
+            return end_as("fail", "failed",
+                          why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
+        return publication_outcome(job, staged, outcome, committed)
+    return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push)
+
+
+def with_stop(text: str, stop: str) -> str:
+    return pipeline.ci.with_section(text, stop) if stop else text
+
+
+@factory.step("ci")
+def watch(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    run = job.run
+    job.b.from_base = False
+
+    def fix(name: str, text: str, failures: str) -> Result:
+        done = step(flow, "implement", tree=tree, round=name, feedback=failures, asks=text)
+        return Result(done.passed, done.data.get("said", ""), structured=done.data.get("verdicts"))
+
+    try:
+        result = pipeline.watch_ci(job.b, job.slot, job.branch, job.picked(job.changed), job.with_prs, job.draft_why,
+                                   fix=fix)
+    except workspace.RunFailed as e:
+        if run.feedback:
+            raise
+        prs = pipeline.pr_link_list(job.with_prs)
+        return end_as("fail", "failed", why=e.why, prs=True,
+                      detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR start a revision, as on any "
+                             "arete PR.")
+    return Outcome("pass", data={"summary": result})
+
+
+@factory.step("publish")
+def publish(flow: factory.Flow) -> Outcome:
+    job: Job = flow.ctx
+    run = job.run
+    if not run.repo.parts:
+        run.enter("done")
+        what = (f"pushed {job.branch} to origin" if job.committed
+                else f"verified and reviewed {job.branch} again with nothing new to push")
+        return end_as("pass", "done", summary=f"{what}: {job.summary}")
+    opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
+    fresh = [c for c in opened if c.github not in job.found]
+    run.enter("pr")
+    if run.feedback:
+        pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
+        run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
+    elif run.repairs:
+        run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
+                + (pipeline.draft_note(job.draft_why, job.verified, kept=True)
+                   or "\n\nThe review now approves it. The PR is still a draft until a person marks it ready."))
+    else:
+        run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
+                + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
+    standing = [c for c in job.picked(job.changed) if c not in fresh]
+    ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
+    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
+                       pipeline.automerge_about(job.ticket, job.build_summary))
+    return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
+
+
+@factory.step("respond")
+def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
+            summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
+            asked: list[dict] | None = None, session: dict | None = None) -> Outcome:
+    job: Job = flow.ctx
+    run, pr_url = job.run, ""
+    if ending == "failed":
+        status, summary, _ = pipeline._fail(run, why, said, detail)
+        pr_url = pipeline.record_prs(run, job.branch, job.with_prs) if prs else ""
+    elif ending == "ask":
+        status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked, session)
+    elif ending == "nothing":
+        status, summary, pr_url = pipeline.nothing_to_build(run, job.ticket, job.ws, job.checkouts, job.branch,
+                                                            summary, job.left_for_a_person)
+    elif ending == "unchanged":
+        status, summary, pr_url = pipeline.answer_without_changes(run, job.ws, job.checkouts, job.branch, summary,
+                                                                  replies or [])
+    elif ending == "pr":
+        pr_url = pipeline.record_prs(run, job.branch, job.with_prs)
+        pipeline.release_workspace(run, job.ws, job.checkouts)
+    elif ending == "done":
+        run.say(done_comment(job, summary))
+        pipeline.release_workspace(run, job.ws, job.checkouts)
+    elif ending == "dry-run":
+        run.log(f"dry run: {summary}; worktree kept at {job.ws}")
+    return Outcome("pass", data={"status": status or ending, "summary": summary, "pr_url": pr_url})
+
+
+def done_comment(job: Job, summary: str) -> str:
+    said = job.review
+    return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
+            f"{pipeline.assumed_block(job.run)}"
+            f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
+            f"{said.markdown()}\n\n"
+            f"Run `{job.run.id}`, {util.paid_note(record.metered_spent(job.run.id))}.")
+
+
+def step(flow: factory.Flow, name: str, **kw) -> Outcome:
+    before = flow.skipped
+    outcome = flow.step(name, **kw)
+    flow.ctx.take(name, outcome, stored=flow.skipped > before)
+    return outcome
+
+
+def finish(flow: factory.Flow, ending: str, **fields) -> tuple[str, str, str]:
+    said = step(flow, "respond", ending=ending, **fields).data
+    return said["status"], said["summary"], said["pr_url"]
+
+
+def ended(flow: factory.Flow, outcome: Outcome) -> tuple[str, str, str]:
+    return finish(flow, **outcome.data)
+
+
+def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
+    job = flow.ctx
+    staged, size, outcome_text = change(job)
+    job.run.save("diff.patch", staged.patch)
+    job.run.save("pr_body.md", gh.outgoing(report(
+        job, size, {}, job.held_reason)))
+    return finish(flow, "dry-run", summary=outcome_text)
+
+
+def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, str]]) -> tuple[str, str, str]:
+    try:
+        return drive(flow)
+    except workspace.RunFailed as e:
+        return finish(flow, "failed", why=e.why, detail=e.detail)
+    except tracker.ERRORS as e:
+        return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
+    except owner_asks.Asked as e:
+        reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
+        parks = e.limit is None
+        return finish(flow, "ask", summary=reached + owner_asks.summary(e.sent),
+                      comment=owner_asks.comment(e.sent, flow.ctx.run.tracker.label_name("needs-info"), e.limit,
+                                           run_id=flow.run_id if parks else ""),
+                      asked=[{"ask_id": ask_id, "step": e.step, "call": e.call, "why": ask["why"],
+                              "tried": ask.get("tried", ""), "questions": ask["questions"]}
+                             for ask_id, ask in zip(e.ask_ids, e.sent, strict=True)],
+                      session=asdict(e.session) if parks else None)
+
+
+def alone(flow: factory.Flow) -> tuple[str, str, bool]:
+    found = [line for line in factory.ends(run_lines.read(flow.run_id)) if line.get("step") == flow.only]
+    if not found:
+        return "failed", f"the script never ran {flow.only}", False
+    said = util.first_line(str(found[-1].get("error") or found[-1].get("feedback") or ""), 300)
+    return "step", f"{flow.only} {found[-1]['result']}" + (f": {said}" if said else ""), found[-1]["result"] == "pass"

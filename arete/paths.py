@@ -1,0 +1,250 @@
+import errno
+import json
+import os
+import re
+import stat
+import sys
+import tomllib
+from contextlib import contextmanager
+from pathlib import Path
+
+HOME = Path.home()
+ON_MAC = sys.platform == "darwin"
+SCRATCH_PREFIX = ".arete-scratch-"
+SCRATCH_SUFFIX = ".noindex"
+SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
+SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}(?:" + re.escape(SCRATCH_SUFFIX) + ")?")
+SEARCH_ONLY = getattr(os, "O_SEARCH", 0)
+NOWHERE = Path("/var/empty/arete-isolated")
+CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
+ISOLATED_LOGINS = "scratch config and state never use this machine's logins, keys or price lookups"
+ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CONFIG_DIR or ARETE_STATE_DIR in a scratch "
+                    f"folder, the config and state folders must both sit, without links, in the one scratch folder "
+                    f"selected for isolation (unset ones go to its config and state folders)")
+
+
+def inside_scratch(d: Path) -> bool:
+    return any(part.startswith(SCRATCH_PREFIX) for part in (*d.absolute().parts, *Path(os.path.realpath(d)).parts))
+
+
+def valid_scratch(root: str) -> os.stat_result | None:
+    try:
+        name = os.path.basename(root)
+        if (not os.path.isabs(root) or os.path.abspath(root) != root or not name.startswith(SCRATCH_PREFIX)
+                or not SCRATCH_TOKEN.fullmatch(name.removeprefix(SCRATCH_PREFIX))):
+            return None
+        st = os.lstat(root)
+    except (OSError, TypeError, ValueError):
+        return None
+    if (not stat.S_ISDIR(st.st_mode) or os.path.realpath(root) != root or st.st_uid != os.getuid()
+            or st.st_mode & 0o077):
+        return None
+    return st
+
+
+def scratch_root(p: Path) -> Path | None:
+    full = Path(os.path.abspath(p))
+    for d in (full, *full.parents):
+        if d.name.startswith(SCRATCH_PREFIX):
+            return d if valid_scratch(str(d)) else None
+    return None
+
+
+def confined(p: Path) -> Path | None:
+    root = scratch_root(p)
+    if root is None:
+        return None
+    here = root
+    for part in Path(os.path.abspath(p)).relative_to(root).parts:
+        here = here / part
+        try:
+            if stat.S_ISLNK(os.lstat(here).st_mode):
+                return None
+        except FileNotFoundError:
+            break
+        except OSError:
+            return None
+    real = Path(os.path.realpath(p))
+    return real if real == root or root in real.parents else None
+
+
+def open_directory(part: str, parent: int, above_target: bool) -> int:
+    flags = os.O_DIRECTORY | os.O_NOFOLLOW
+    if above_target and SEARCH_ONLY:
+        try:
+            return os.open(part, SEARCH_ONLY | flags, dir_fd=parent)
+        except PermissionError:
+            pass
+    return os.open(part, os.O_RDONLY | flags, dir_fd=parent)
+
+
+@contextmanager
+def directory_fd(p: Path, parent: int | None = None, create: bool = False):
+    parts = p.parts
+    if ".." in parts or (parent is not None and p.is_absolute()):
+        raise PermissionError("directory traversal refused")
+    fd = os.dup(parent) if parent is not None else os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        walked = parts if parent is not None else p.absolute().parts[1:]
+        for index, part in enumerate(walked):
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            next_fd = open_directory(part, fd, index < len(walked) - 1)
+            os.close(fd)
+            fd = next_fd
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_confined(p: Path, limit: int | None = None) -> bytes:
+    if not ISOLATED:
+        with open(p, "rb") as f:
+            return f.read(-1 if limit is None else limit)
+    root = scratch_root(p)
+    parts = Path(os.path.abspath(p)).parts
+    if root is None or len(parts) <= len(root.parts) or ".." in Path(p).parts:
+        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p))
+    try:
+        expected = os.lstat(root)
+        with directory_fd(root) as root_fd:
+            current = os.fstat(root_fd)
+            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
+                raise PermissionError("scratch credential root replaced")
+            with directory_fd(p.absolute().parent.relative_to(root), root_fd) as parent:
+                source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(source, "rb") as f:
+                    st = os.fstat(source)
+                    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+                        raise FileNotFoundError(errno.ENOENT, "not a plain file of this user", str(p))
+                    return f.read(-1 if limit is None else limit)
+    except OSError as e:
+        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
+
+
+def isolated_dirs() -> tuple[Path, Path]:
+    given = {name: os.environ.get(f"ARETE_{name.upper()}_DIR", "") for name in ("config", "state")}
+    roots = {str(r) if (r := scratch_root(Path(v))) else "" for v in given.values() if v}
+    if asked := os.environ.get(SCRATCH_ENV, ""):
+        roots.add(asked)
+    root = roots.pop() if len(roots) == 1 else ""
+    config, state = (Path(given[name] or os.path.join(root, name)) for name in ("config", "state"))
+    if not root or valid_scratch(root) is None or confined(config) is None or confined(state) is None:
+        raise SystemExit(ISOLATED_REFUSAL)
+    return config, state
+
+
+def drop_credentials() -> None:
+    for name in [n for n in os.environ if CREDENTIAL_NAME.search(n)]:
+        del os.environ[name]
+
+
+CONFIG_DIR = Path(os.environ.get("ARETE_CONFIG_DIR", HOME / ".config" / "arete"))
+STATE_DIR = Path(os.environ.get("ARETE_STATE_DIR", HOME / ".local" / "share" / "arete"))
+CLIENT_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "arete-client"
+GUARD_HOOK = sys.argv[1:2] in (["guard"], ["codex-guard"])
+ISOLATED = not GUARD_HOOK and (bool(os.environ.get(SCRATCH_ENV)) or inside_scratch(CONFIG_DIR)
+                               or inside_scratch(STATE_DIR))
+if ISOLATED:
+    CONFIG_DIR, STATE_DIR = isolated_dirs()
+    drop_credentials()
+SCRATCH_CONFIG = confined(CONFIG_DIR) is not None
+SCRATCH_STATE = confined(STATE_DIR) is not None
+LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete" if ON_MAC and not ISOLATED
+                              else STATE_DIR / "logs"))
+
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+PI_KEYS_FILE = (CONFIG_DIR if SCRATCH_CONFIG or not ISOLATED else NOWHERE) / "pi.env"
+EVENTS_FILE = STATE_DIR / "events.jsonl"
+DB_FILE = STATE_DIR / "arete.db"
+
+
+def backups_dir() -> Path:
+    return DB_FILE.parent / "backups"
+
+
+RUNS_DIR = STATE_DIR / "runs"
+WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
+                                    if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
+HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+SERVER_FILE = STATE_DIR / "server.json"
+DASHBOARD_PORT = 8796
+TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
+TLS_KEY_FILE = STATE_DIR / "dashboard.key"
+PUSH_KEY_FILE = STATE_DIR / "webpush.key"
+LOCKS_DIR = STATE_DIR / "locks"
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+PROMPTS_DIR = PACKAGE_DIR / "prompts"
+ADWS_DIR = PACKAGE_DIR.parent / "adws"
+CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
+CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
+
+
+PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
+
+
+def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
+    pinned = "" if args[:1] and args[0] in PER_CALL_HOOKS else "from arete import codebase; codebase.load(); "
+    entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
+                  "from arete.cli import main; raise SystemExit(main())")
+    return [sys.executable, "-I", *flags, "-c", entrypoint, *args]
+
+
+def expand(p: str | Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(p))))
+
+
+def dashboard_ports() -> frozenset[int]:
+    found = {DASHBOARD_PORT}
+    try:
+        data = tomllib.loads(read_confined(CONFIG_FILE).decode())
+        found.add(int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        record = json.loads(SERVER_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        record = None
+    if isinstance(record, dict) and isinstance(record.get("port"), int):
+        found.add(record["port"])
+    return frozenset(found)
+
+
+def state_and_config() -> dict:
+    return {"state": str(STATE_DIR.resolve()), "config": str(CONFIG_FILE.resolve())}
+
+
+def short_path(p: str | Path) -> str:
+    s, home = str(p), str(HOME)
+    if s == home:
+        return "~"
+    below_home = home.rstrip(os.sep) + os.sep
+    return "~/" + s[len(below_home):] if s.startswith(below_home) else s
+
+
+def scratch_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "scratch"
+
+
+def record_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "record"
+
+
+def draft_dir(run_id: str) -> Path:
+    return RUNS_DIR / run_id / "draft"
+
+
+def ensure_dirs() -> None:
+    for d in (STATE_DIR, RUNS_DIR, WORKTREES_DIR, LOCKS_DIR, LOG_DIR):
+        if ISOLATED:
+            root = scratch_root(STATE_DIR)
+            if root is None:
+                raise PermissionError("isolated state directory unavailable")
+            with directory_fd(root) as parent, directory_fd(d.absolute().relative_to(root), parent, create=True):
+                pass
+        else:
+            d.mkdir(parents=True, exist_ok=True)
