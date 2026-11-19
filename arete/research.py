@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+import difflib
+import hashlib
+import os
+import re
+import tempfile
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import (
+    config,
+    gh,
+    jev,
+    jev_verdicts,
+    paths,
+    prompt_loader,
+    research_budget,
+    research_plan,
+    research_search,
+    research_synthesis,
+    runner,
+    screening,
+    tracker,
+    triage,
+    util,
+    workspace,
+)
+from .agent import READ_TOOLS, Result
+from .heartbeat import mark_loop, network_up_or_skip
+from .store import insights as insights_store
+from .store import triage as triage_store
+
+REPORTS_DIR = paths.STATE_DIR / "research"
+TOOLS = [*READ_TOOLS,"WebSearch", "WebFetch"]
+TIMEOUT_SECONDS = 40 * 60
+BUDGET_USD = 5.0
+REPORT_RESERVE_USD = 4.0
+REPORT_RESERVE_SECONDS = 30 * 60
+SEARCHED_RESERVE_USD = 1.0
+SEARCHED_RESERVE_SECONDS = 10 * 60
+AUDIT_RESERVE_USD = 0.5
+AUDIT_RESERVE_SECONDS = 5 * 60
+SCHEMA = {
+    "type": "object",
+    "properties": {"summary": {"type": "string"}, "report": {"type": "string"}, "name": {"type": "string"}},
+    "required": ["summary", "report"],
+}
+RELATED_CHARS = 6000
+DONE, FAILED, HELD, RUNNING, LATER, PARENT, ANSWERED, KEPT = (
+    "done", "failed", "held", "running", "later", "parent", "answered", "kept")
+NO_RUN = (HELD, PARENT, ANSWERED, KEPT)
+CHANGED = ("Does what changed in the ticket ask something different, or add a fact, decision, limit, deadline or "
+           "resource the report should use? Answer no when it only rewords, fixes a typo, adds a bare link, or adds a "
+           "comment that asks nothing new, such as a status note, a sprint move, a meeting time, thanks, a mention or "
+           "a request for an update.")
+ANSWERS = ("Which of these existing reports already delivers what this ticket asks for, so a new report would only "
+           "repeat it? Pick none when the ticket asks for a different deliverable, such as steps, a scope, a list of "
+           "tickets, an estimate or a decision the report does not give, even when it covers the same topic, and pick "
+           "none for a report that belongs to a different project.")
+NONE_ANSWERS = "none of these: the ticket asks for something these reports do not deliver"
+TITLE_LINE = re.compile(r"\A#[ \t]+\S.*\n+")
+
+
+def report_file(ref: str) -> Path:
+    return REPORTS_DIR / f"{tracker.safe_filename(ref)}.md"
+
+
+@dataclass(frozen=True)
+class Home:
+    repo: config.Repo
+    layer: config.RepoLayer
+
+    @property
+    def folder(self) -> str:
+        return self.layer.research_dir
+
+    @property
+    def base(self) -> str:
+        return self.layer.base_branch or gh.default_branch(self.repo.github)
+
+
+def home_of(src: triage.TriageSource, r: dict) -> Home | None:
+    named = [repo for repo in src.repos if repo.name in set(r["repos"])]
+    for repo in named or (list(src.repos) if len(src.repos) == 1 else []):
+        layer = config.load_layer(repo.layer_dir)
+        if layer.research_dir and repo.github:
+            return Home(repo, layer)
+    return None
+
+
+def filing(h: Home | None, path: str) -> dict[str, str]:
+    if not h:
+        return {"filing": "Arete keeps the report and shows it under the ticket's title.",
+                "shape": "Write no title line. Start with the answer.", "file_name": "leave it empty."}
+    where = f"`{path}`" if path else f"a new file in `{h.folder}/`"
+    return {"filing": (f"Arete files the report in the `{h.repo.name}` repo as {where}, beside the reports already in "
+                       f"{h.repo.path / h.folder}. Read two or three of them first, and write this one the way they "
+                       "are written: the same title line, header fields and sections."),
+            "shape": "Write the whole file, title line included, and lead with the answer as the reports beside it do.",
+            "file_name": ("leave it empty; the file keeps its name." if path else
+                          "a short kebab-case file name for it, without `.md`, like the names of the reports beside it.")}
+
+
+def kept_path(h: Home | None, prior: dict | None) -> str:
+    path = (prior or {}).get("filed_path") or ""
+    if not h or not path.startswith(f"{h.folder}/"):
+        return ""
+    url = (prior or {}).get("filed_url") or ""
+    return path if not url or f"/{h.repo.github.lower()}/" in url.lower() else ""
+
+
+def claim_path(h: Home, name: str, title: str) -> str:
+    base = h.base
+    util.git(["fetch", "-q", "origin", base], h.repo.path)
+    taken = set(util.git_records(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path))
+    taken |= {report["filed_path"] for report in insights_store.research_rows()}
+    stem = prompt_loader.slug(name or title, 60)
+    return next(path for n in range(1, 100)
+                if (path := f"{h.folder}/{stem if n == 1 else f'{stem}-{n}'}.md") not in taken)
+
+
+def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
+    path = report["filed_path"]
+    tk = tracker.for_repo(cfg, h.repo)
+    t = tracker.Ticket(id=candidate(r).id, ref=r["ref"], title=r["title"], url=r["url"])
+    key = f"research-{tracker.safe_filename(r['ref'])}"
+    branch = f"arete/{key}"
+    subject = tk.pr_title(prompt_loader.fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
+                                        title=r["title"]), t)
+    link = tk.pr_link(t, whole=True)
+    body = (f"**Summary:** {report['summary']}\n\n"
+            f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
+            "When the ticket changes, arete researches it again and pushes the new report here.")
+    base = h.base
+    wt = workspace.make_worktree(h.repo, base, branch, key)
+    try:
+        (wt / path).parent.mkdir(parents=True, exist_ok=True)
+        (wt / path).write_text(report_file(r["ref"]).read_text())
+        util.git(["add", "--", path], wt)
+        if not util.git(["diff", "--cached", "--name-only"], wt).strip():
+            return gh.open_pr_url(h.repo.github, branch) or f"https://github.com/{h.repo.github}/blob/{base}/{path}"
+        util.git_as_owner(["commit", "-q", "-m", f"{subject}\n\nArete-Research: {r['ref']}", "--", path], wt)
+        util.git(["push", "-q", "--force", "-u", "origin", branch], wt)
+        if url := gh.open_pr_url(h.repo.github, branch):
+            gh.pr_edit_body(url, body, link=link)
+            return url
+        return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
+    finally:
+        workspace.remove_worktree(h.repo, wt)
+
+
+def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
+    report = insights_store.research_get(r["ref"])
+    try:
+        url = file_report(cfg, h, r, report)
+    except (RuntimeError, OSError) as e:
+        return False, (f"report written to {paths.short_path(report_file(r['ref']))}, but filing it in {h.repo.name} "
+                       f"failed, and the research loop tries again: {util.first_line(str(e), 300)}")
+    insights_store.research_keep(r["ref"], filed_url=url)
+    return True, f"report filed in {h.repo.name} as {report['filed_path']}: {url}"
+
+
+def jira_target(cfg: config.Config, r: dict, to: str) -> str:
+    return cfg.jira.research.get(to, "") if r["tracker"] == "jira" else ""
+
+
+def move(cfg: config.Config, r: dict, to: str) -> None:
+    target = jira_target(cfg, r, to)
+    src = source_of(cfg, r)
+    if not target or r.get("closed") or not isinstance(src, triage.JiraSource):
+        return
+    try:
+        m = tracker.JiraTracker(src.repos[0], cfg.jira).shift(r["ref"], target, stamps=True)
+    except tracker.ERRORS as e:
+        util.log_ref(r['ref'], f"could not move it to {target}, trying next tick: "
+              f"{util.first_line(str(e), 300)}")
+        return
+    if m.error:
+        util.log_ref(r['ref'], f"not moved: {util.first_line(m.error, 300)}")
+    elif m.moved:
+        util.log_ref(r['ref'], f"moved to {target}")
+        own_move(r, m)
+    fields = {"moved": to}
+    if to in ("pr", config.DELIVERED):
+        fields["error"] = f"not moved: {m.error}" if m.error else ""
+    if to == config.DELIVERED and not m.error:
+        fields["delivered"] = util.iso()
+    insights_store.research_keep(r["ref"], **fields)
+
+
+def own_move(r: dict, m: tracker.Moved) -> None:
+    if not (m.before and m.after):
+        return
+    with util.lock(triage.BOARD_LOCK, wait=True):
+        row = triage.board_row(r["ref"])
+        if not row or triage.moment(row["updated"]) != triage.moment(m.before):
+            return
+        report = insights_store.research_get(r["ref"])
+        triage_store.triage_put({**row, "updated": m.after})
+        if report and report["updated"] == row["updated"]:
+            insights_store.research_keep(r["ref"], updated=m.after)
+    r["updated"] = m.after
+
+
+def wanted(r: dict, report: dict) -> str:
+    if report["status"] == FAILED:
+        return FAILED
+    if report["status"] != DONE:
+        return ""
+    if not report["filed_path"]:
+        return config.DELIVERED
+    url = report["filed_url"]
+    if not url:
+        return ""
+    if "/pull/" not in url:
+        return config.DELIVERED
+    pr = gh.pr_view(url)
+    if pr.get("mergedAt"):
+        return config.DELIVERED
+    return "pr" if pr.get("state") == "OPEN" else ""
+
+
+def settle_status(cfg: config.Config, r: dict) -> None:
+    report = insights_store.research_get(r["ref"])
+    if (not report or report["status"] not in (DONE, FAILED) or report.get("moved") == config.DELIVERED
+            or r.get("closed")):
+        return
+    if not any(jira_target(cfg, r, to) for to in ("pr", FAILED, config.DELIVERED)):
+        return
+    try:
+        to = wanted(r, report)
+    except gh.GhError as e:
+        util.log_ref(r['ref'], f"could not read {report['filed_url']}: {util.first_line(str(e), 300)}")
+        return
+    if not to or to == report.get("moved"):
+        return
+    if not jira_target(cfg, r, to):
+        insights_store.research_keep(r["ref"], moved=to)
+        return
+    move(cfg, r, to)
+
+
+def settle_statuses(cfg: config.Config) -> None:
+    for r in tickets():
+        settle_status(cfg, r)
+
+
+def file_unfiled(cfg: config.Config) -> list[str]:
+    rows = {r["ref"]: r for r in tickets()}
+    failed = []
+    for report in insights_store.research_rows():
+        r = rows.get(report["ref"])
+        if not r or report["status"] != DONE or not report["filed_path"] or report["filed_url"]:
+            continue
+        if (src := source_of(cfg, r)) and (h := home_of(src, r)):
+            ok, why = file_in_home(cfg, h, r)
+            util.log_ref(r['ref'], f"{why}")
+            failed += [] if ok else [f"{r['ref']}: {why}"]
+    return failed
+
+
+def tickets() -> list[dict]:
+    rows = [r for r in triage_store.triage_rows() if triage.standing(r) == triage.RESEARCH_WORK]
+    return sorted(rows, key=lambda r: triage.moment(r["updated"]), reverse=True)
+
+
+def ticket(ref: str) -> dict | None:
+    r = triage.board_row(ref)
+    return r if r and triage.standing(r) == triage.RESEARCH_WORK else None
+
+
+def due() -> list[dict]:
+    return [r for r in tickets() if not r.get("closed") and triage.in_sprint(r)
+            and triage.research_due(r, insights_store.research_get(r["ref"]))]
+
+
+def adopt_reports() -> None:
+    for file in REPORTS_DIR.glob("*.md"):
+        text = file.read_text()
+        lines = text.splitlines()
+        heading = re.fullmatch(r"# (\S+): (.+)", lines[0]) if lines else None
+        if not heading:
+            continue
+        ref, title = heading.groups()
+        if file.name != report_file(ref).name or insights_store.research_get(ref):
+            continue
+        url = lines[2] if len(lines) > 2 and lines[2].startswith("http") else ""
+        summary = next((line.removeprefix("**Summary:** ") for line in lines
+                        if line.startswith("**Summary:** ")), "")
+        researched = next((line for line in lines if line.startswith("Researched")), "")
+        cost = re.search(r"\$(\d+(?:\.\d+)?)", researched)
+        insights_store.research_set(ref, status=DONE, title=title, url=url, summary=summary, report=text,
+                           cost=float(cost[1]) if cost else 0.0, updated="", source="", ticket="", basis="",
+                           answered_by="", filed_path="", filed_url="", moved="", delivered="", error="", run_id="")
+
+
+def tidy() -> None:
+    for report in insights_store.research_rows():
+        if report["status"] == RUNNING:
+            insights_store.research_set(report["ref"], status=FAILED, error="the run stopped before it finished")
+    adopt_reports()
+
+
+def source_of(cfg: config.Config, r: dict) -> triage.TriageSource | None:
+    return next((s for s in triage.sources(cfg) if s.name == r["source"]), None)
+
+
+def candidate(r: dict) -> triage.Candidate:
+    tid = triage.issue_id(r["tracker"], r["ref"])
+    return triage.Candidate(r["ref"], tid, r["title"], r["url"], r["updated"])
+
+
+def digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:20]
+
+
+def family(r: dict, rows: list[dict]) -> list[tuple[str, dict]]:
+    parent = r.get("parent") or ""
+    kin = []
+    for o in rows:
+        if o["ref"] == r["ref"]:
+            continue
+        if parent and o["ref"] == parent:
+            kin.append(("parent", o))
+        elif parent and o.get("parent") == parent:
+            kin.append(("sibling", o))
+        elif o.get("parent") == r["ref"]:
+            kin.append(("child", o))
+    return kin
+
+
+def delta(old: str, new: str) -> str:
+    a, b = old.split("\n"), new.split("\n")
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op in ("delete", "replace"):
+            out += ["Removed:", *a[i1:i2]]
+        if op in ("insert", "replace"):
+            out += ["Added:", *b[j1:j2]]
+    return "\n".join(out)
+
+
+def change_matters(cfg: config.Config, r: dict, prior: dict, said: str) -> float | None:
+    trace = ("", f"research {r['ref']} changed jev")
+    text = (f"Ticket {r['ref']}\n\n## Text the report was written from\n\n{prior['ticket']}\n\n"
+            f"## What changed in the ticket since\n\n{delta(prior['ticket'], said)}\n\n"
+            f"## The report's summary\n\n{prior['summary']}")
+    a = jev.ask(text, {"changed": jev.yes_no(CHANGED)}, cfg, trace=trace).answers.get("changed")
+    if a is None:
+        return None
+    score = jev_verdicts.scored(a.yes, cfg.jev.research_rerun, over=False)
+    kept = jev_verdicts.holds(score)
+    jev_verdicts.record(jev.traced_run(trace), "changed", r["ref"], r["title"], {"changed": score},
+                    f"kept the report, the change does not need it (p {a.yes:.2f})" if kept else "",
+                    "skipped" if kept else "went on")
+    return a.yes
+
+
+def still_stands(cfg: config.Config, r: dict, prior: dict | None, said: str, basis: str, judged: bool) -> str:
+    if prior and prior["status"] == FAILED and prior["basis"] and basis == prior["basis"]:
+        return "the last try failed and its text has not changed since"
+    if not prior or prior["status"] not in (DONE, PARENT, ANSWERED):
+        return ""
+    if basis == prior["basis"] or prior["status"] == DONE and said == prior["ticket"]:
+        return "its text has not changed since the last check; only its status, sprint or labels moved"
+    if prior["status"] != DONE or not prior["ticket"] or not judged:
+        return ""
+    p = change_matters(cfg, r, prior, said)
+    if p is None or p >= cfg.jev.research_rerun:
+        return ""
+    return f"JEV reads the change in its text as one the report does not need (p {p:.2f}), so the report stands"
+
+
+def parent_hold(r: dict, ticket: triage.TicketText, kin: list[tuple[str, dict]]) -> str:
+    children = [o["ref"] for relation, o in kin if relation == "child"]
+    if not children or not ticket.thin():
+        return ""
+    return (f"it has no description of its own and its children {', '.join(children)} are research tickets, so their "
+            "reports cover it")
+
+
+def answered_by(cfg: config.Config, r: dict, ticket: triage.TicketText, done: list[tuple[str, dict, dict]],
+                titles: dict[str, str]) -> tuple[str, float]:
+    def part_of(o: dict) -> str:
+        p = o.get("parent") or ""
+        return f" (part of {p}: {titles[p]})" if p in titles else f" (part of {p})" if p else ""
+
+    options = {o["ref"]: f"{o['title']}{part_of(o)}. Its report: {report['summary']}" for _, o, report in done}
+    options["none"] = NONE_ANSWERS
+    trace = ("", f"research {r['ref']} answered jev")
+    a = jev.ask(f"Ticket {r['ref']}: {r['title']}\n\n{ticket.text}", {"answered": jev.pick(ANSWERS, options)}, cfg,
+                trace=trace).answers.get("answered")
+    if a is None:
+        return "", 0.0
+    p = 1 - a.probabilities.get("none", 0.0)
+    top = str(a.value) if a.value in options and a.value != "none" else ""
+    score = jev_verdicts.scored(p, cfg.jev.research_answered)
+    link = top if top and jev_verdicts.holds(score) else ""
+    jev_verdicts.record(jev.traced_run(trace), "answered", r["ref"], r["title"], {"answered": score},
+                    f"answered by the report for {link} (p {p:.2f})" if link else "", "skipped" if link else "went on")
+    return link, p
+
+
+def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]]) -> str:
+    parts = []
+    if r.get("parent"):
+        try:
+            if brief := src.brief(r["parent"]):
+                parts.append(f"### Its parent ticket, {brief}")
+        except tracker.ERRORS as e:
+            util.log_ref(r['ref'], f"could not read its parent {r['parent']}: {e}")
+    for relation, o, report in done:
+        text = report["report"]
+        if len(text) > RELATED_CHARS:
+            text = text[:RELATED_CHARS] + f"\n\n[cut at {RELATED_CHARS} characters]"
+        parts.append(f"### Report already written for its {relation} {o['ref']}: {o['title']}\n\n{text}")
+    if not parts:
+        return "none"
+    return ("These come from the same family of tickets. Build on the reports: cite them by ticket key where they "
+            "already answer part of this ticket, and spend this report on what they do not cover.\n\n"
+            + "\n\n".join(parts))
+
+
+def budget_for(cfg: config.Config) -> research_budget.Budget:
+    searching = cfg.research_search
+    audited = searching and cfg.research_audit
+    return research_budget.Budget(BUDGET_USD, TIMEOUT_SECONDS,
+                                  (SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD)
+                                  + (AUDIT_RESERVE_USD if audited else 0),
+                                  (SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
+                                  + (AUDIT_RESERVE_SECONDS if audited else 0))
+
+
+def spent_error(budget: research_budget.Budget) -> tuple[Result, float]:
+    return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
+                                  "so no report was written"), budget.spent_usd
+
+
+def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
+           family: list[str], started: float | None = None, judged: bool = False) -> tuple[Result, float]:
+    budget = budget_for(cfg)
+    if started is not None:
+        budget.started = started
+    planned = research_plan.plan(cfg, budget, prompt_loader.prompt("research_plan", **values), cwd, add_dirs, ref, family)
+    if not planned.plan:
+        return Result(ok=False, error=planned.error), budget.spent_usd
+    plan = planned.plan
+    util.log_ref(ref, (
+        f"planned {util.count(len(plan['tasks']), 'search task')} (try {planned.tries})" if plan["needs_search"]
+        else f"planned no search: the reports for {', '.join(plan['covered_by'])} cover it"))
+    return report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs)
+
+
+def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
+    usd, seconds = budget.final()
+    if budget.short(usd, seconds):
+        return spent_error(budget)
+    brief = research_plan.brief(plan)
+    tools = TOOLS if plan["needs_search"] else READ_TOOLS
+    if plan["needs_search"] and cfg.research_search:
+        found = research_search.run(cfg, budget, plan, ref, judged)
+        if found.error:
+            return Result(ok=False, error=found.error), budget.spent_usd
+        usd, seconds = budget.final()
+        if budget.short(usd, seconds):
+            return spent_error(budget)
+        if cfg.research_synthesis:
+            res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
+            return res, budget.spent_usd
+        brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
+    res = budget.call(prompt_loader.prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
+                      model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
+                      add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)
+    return res, budget.spent_usd
+
+
+def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = False) -> tuple[str, str]:
+    started = time.monotonic() if cfg.research_planner else None
+    ref = r["ref"]
+    base = {"source": r["source"], "title": r["title"], "url": r["url"], "updated": r["updated"],
+            "run_id": os.environ.get("ARETE_RUN_ID", ""), "answered_by": ""}
+    src = source_of(cfg, r)
+    if not src:
+        return LATER, f"{r['source']} is no longer a triage source"
+    try:
+        ticket = src.ticket(candidate(r))
+    except tracker.ERRORS as e:
+        return LATER, f"could not read {ref}: {e}"
+    text, said = ticket.text, ticket.said(r["title"])
+    basis = digest(said)
+    prior = insights_store.research_get(ref)
+    rows = tickets()
+    reports = {x["ref"]: x for x in insights_store.research_rows()}
+    kin = family(r, rows)
+    done = [(relation, o, reports[o["ref"]]) for relation, o in kin
+            if o["ref"] in reports and reports[o["ref"]]["status"] == DONE and reports[o["ref"]]["report"]]
+    judged = jev.ready(cfg, list(src.repos))
+    if skipped := screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+        return skipped
+    dirs, h, filed_path, values = begin(cfg, r, src, prior, basis, text, done, base)
+    res, paid = ask(cfg, ref, values, h, filed_path, dirs, done, started, judged)
+    return finish_report(cfg, r, res, paid, h, filed_path, said, basis)
+
+
+def screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+    ref, text = r["ref"], ticket.text
+    if not force:
+        if not asked and (why := still_stands(cfg, r, prior, said, basis, judged)):
+            insights_store.research_keep(ref, title=r["title"], url=r["url"], updated=r["updated"], basis=basis)
+            return KEPT, why
+        fresh = not (prior and prior["status"] == DONE)
+        if fresh and (why := parent_hold(r, ticket, kin)):
+            insights_store.research_set(ref, **base, status=PARENT, error=why, basis=basis)
+            return PARENT, why
+        if fresh and judged and done:
+            link, p = answered_by(cfg, r, ticket, done, {o["ref"]: o["title"] for o in rows})
+            if link:
+                why = f"the report for {link} already answers it (JEV p {p:.2f})"
+                insights_store.research_set(ref, **(base | {"answered_by": link}), status=ANSWERED, error=why, basis=basis)
+                return ANSWERED, why
+        if not judged:
+            why = "JEV is off, so nothing screens the ticket"
+            insights_store.research_set(ref, **base, status=HELD, error=why)
+            return HELD, why
+        screened = screening.screen(f"{r['title']}\n\n{text}", cfg, list(src.repos),
+                                    ("", f"research {ref} injection jev"))
+        if screening.held(screened, screening.Posture.REQUIRED):
+            if screened.status != screening.FLAGGED:
+                return LATER, f"JEV could not screen {ref}"
+            why = f"JEV reads text in it as instructions to an agent (p {screened.p:.2f})"
+            insights_store.research_set(ref, **base, status=HELD, error=why)
+            return HELD, why
+
+
+def begin(cfg, r, src, prior, basis, text, done, base):
+    ref = r["ref"]
+    insights_store.research_set(ref, **base, status=RUNNING, error="", basis=basis,
+                       **({} if r.get("closed") else {"moved": "", "delivered": ""}))
+    move(cfg, r, "running")
+    named = set(r["repos"])
+    repos = sorted(src.repos, key=lambda repo: repo.name not in named)
+    dirs = list(dict.fromkeys(repo.path for repo in repos if repo.path.is_dir()))
+    h = home_of(src, r)
+    filed_path = kept_path(h, prior)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    util.log_ref(ref, "researching")
+    values = {"ref": ref, "title": r["title"], "ticket": text, "related": related(src, r, done),
+              "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
+    return dirs, h, filed_path, values
+
+
+def ask(cfg, ref, values, h, filed_path, dirs, done, started, judged):
+    with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
+        if cfg.research_planner:
+            res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
+                              [o["ref"] for _, o, _ in done], started, judged)
+        else:
+            res = runner.run(prompt_loader.prompt("research", **values, **filing(h, filed_path)),
+                             cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
+                             json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
+                             timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
+                             cfg=cfg)
+            paid = res.paid_usd
+    return res, paid
+
+
+def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
+    ref = r["ref"]
+    answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
+    report = str(answer.get("report") or "").strip()
+    if not report:
+        why = util.first_line(res.error or "the agent gave no report")
+        insights_store.research_set(ref, status=FAILED, error=why, cost=paid)
+        move(cfg, r, "failed")
+        return FAILED, why
+    summary = " ".join(str(answer.get("summary") or "").split())
+    if h:
+        titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
+        contents = f"{titled.rstrip()}\n"
+        report = TITLE_LINE.sub("", titled, count=1)
+    else:
+        contents = (f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
+                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{report}\n")
+    report_file(ref).write_text(contents)
+    if h:
+        try:
+            filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
+        except RuntimeError as e:
+            insights_store.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
+                               summary=summary, report=report)
+            move(cfg, r, "failed")
+            return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
+    insights_store.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
+                       ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+    if h:
+        ok, why = file_in_home(cfg, h, r)
+        outcome, why = DONE if ok else FAILED, f"{why} ({util.paid_note(paid)})"
+    else:
+        outcome, why = DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(paid)})"
+    settle_status(cfg, r)
+    return outcome, why
+
+
+def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
+    paths.ensure_dirs()
+    cfg = config.load()
+    with util.lock("research") as got:
+        if not got:
+            print(f"{util.iso()} research already running" + ("; ask again when it ends" if asked else ""))
+            return 1 if asked else 0
+        if dry_run and asked:
+            return preview_asked(asked)
+        if dry_run:
+            todo = due()
+            print(f"would research {todo[0]['ref'] if todo else 'nothing'}"
+                  + (f"; {len(todo) - 1} more due after it" if len(todo) > 1 else ""))
+            return 0
+        tidy()
+        if not network_up_or_skip("research", dry_run):
+            return 1 if asked else 0
+        unfiled = file_unfiled(cfg)
+        settle_statuses(cfg)
+        if asked:
+            return research_asked(cfg, asked, unfiled)
+        todo = due()
+        if not todo:
+            mark_loop("research", not unfiled, unfiled[0] if unfiled else "nothing due")
+            return 1 if unfiled else 0
+        for r in todo:
+            outcome, why = research(cfg, r)
+            util.log_ref(r['ref'], f"{outcome}: {why}")
+            if outcome not in NO_RUN:
+                break
+        ok = outcome in (DONE, *NO_RUN)
+        mark_loop("research", ok and not unfiled, unfiled[0] if ok and unfiled else why)
+        return 1 if outcome in (FAILED, LATER) or unfiled else 0
+
+
+def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) -> int:
+    rows = {r["ref"].lower(): r for r in tickets()}
+    failures = []
+    for event in asked:
+        ref = str(event.get("ref") or "")
+        if not (r := rows.get(ref.lower())):
+            outcome, why = FAILED, "it is no longer a research ticket on the triage board"
+        else:
+            ref = r["ref"]
+            outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
+        util.log_ref(ref, f"{outcome}: {why}")
+        if outcome in (FAILED, LATER):
+            failures.append(f"{ref}: {why}")
+    mark_loop("research", not failures and not unfiled, failures[0] if failures else unfiled[0] if unfiled else why)
+    return 1 if failures or unfiled else 0
+
+
+def preview_asked(asked: list[dict]) -> int:
+    rows = {r["ref"].lower(): r for r in tickets()}
+    missing = []
+    for event in asked:
+        ref = str(event.get("ref") or "")
+        if r := rows.get(ref.lower()):
+            print(f"would research {r['ref']}")
+        else:
+            missing.append(ref)
+            print(f"would not research {ref}: it is no longer a research ticket on the triage board")
+    return 1 if missing else 0
+
+
+def run_now(ref: str, force: bool = False, dry_run: bool = False) -> int:
+    paths.ensure_dirs()
+    cfg = config.load()
+    r = ticket(ref)
+    if not r:
+        print(f"{ref} is not a research ticket on the triage board; `arete research` lists them", flush=True)
+        return 1
+    with util.lock("research") as got:
+        if not got:
+            print("a research run is going; try again when it ends")
+            return 1
+        if dry_run:
+            print(f"would research {r['ref']}")
+            return 0
+        tidy()
+        outcome, why = research(cfg, r, force=force, asked=True)
+    print(f"{r['ref']}: {outcome}: {why}")
+    return 0 if outcome in (DONE, KEPT) else 1
+
+
+def listing() -> str:
+    rows = tickets()
+    if not rows:
+        return "no research tickets on the triage board"
+    width = max(len(r["ref"]) for r in rows)
+    lines = []
+    for r in rows:
+        report = insights_store.research_get(r["ref"])
+        notes = [triage.research_note(r, report), report and report["status"] == DONE and report["filed_url"]]
+        lines += [f"{r['ref']:<{width}}  {r['title']}", *(f"{'':<{width}}  {n}" for n in notes if n)]
+    return "\n".join(lines + ["", "`arete research REF` prints a report; `--run` runs one now."])
+
+
+def shown(ref: str) -> str | None:
+    report = insights_store.research_get(ref)
+    if report and report["status"] == ANSWERED and (linked := shown(report["answered_by"])):
+        return f"{report['ref']}: not researched: {report['error']}\n\n{linked}"
+    if report and report["report"]:
+        text = report_file(report["ref"]).read_text() if report_file(report["ref"]).exists() else report["report"]
+        if not report["filed_path"]:
+            return text
+        where = report["filed_url"] or "not filed yet; the research loop tries again"
+        return f"{report['ref']}: {report['filed_path']}: {where}\n\n{text}"
+    r = ticket(ref)
+    if not r and not report:
+        return None
+    return f"{ref}: {triage.research_note(r, report) if r else report['status']}"

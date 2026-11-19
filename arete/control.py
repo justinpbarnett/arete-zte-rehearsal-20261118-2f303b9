@@ -1,0 +1,405 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import signal
+import subprocess
+import threading
+from collections import Counter, defaultdict
+from datetime import timedelta
+
+from . import (
+    config,
+    delivery,
+    devices,
+    events,
+    launch_lease,
+    loops,
+    paths,
+    principals,
+    record,
+    refusals,
+    run_lines,
+    sources,
+    util,
+    webhooks,
+)
+from .agent import billing_of
+from .loops import Loop
+from .store import db as foundation
+from .store import loops as loop_store
+from .store import runs as run_store
+from .store import sources as source_store
+from .store import writes
+
+AB_DAYS = 30
+AB_MIN_TICKETS = 20
+REPAIRS = tuple(r for r, b in config.INHERITS.items() if b == "build")
+BEAT_FILE = paths.STATE_DIR / "serve.json"
+BEAT_STALE_SECONDS = 120
+STUCK_TICKS = 3
+
+
+def serious_failure(key: str) -> bool:
+    return key in ("tick", "tick:load") or key.startswith(("stage:", "loop:"))
+DETACHED_LOG = "loops.log"
+COST_DAYS = 7
+COST_GROUPS = ("step", "kind", "model", "route")
+STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
+TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
+
+
+class NotFound(refusals.NotFound, LookupError):
+    pass
+
+
+class Busy(refusals.Conflict, RuntimeError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"{name} is running; stop it or wait")
+
+
+class Refused(refusals.Invalid, ValueError):
+    pass
+
+
+class KeptFailure(Refused):
+    pass
+
+
+def session_report(run_id: str, connect=foundation.reader) -> dict:
+    row = run_store.run_get(run_id, connect)
+    if not row or row["kind"] != "session":
+        raise NotFound(f"no session {run_id}")
+    report = run_store.report(run_id, connect)
+    if report is None:
+        why = "it is still running" if row["status"] == "running" else f"it ended {row['status']} without one"
+        raise Refused(f"session {run_id} has no report: {why}")
+    return {"id": run_id, "status": row["status"], "finished": row["finished"], "pr_url": row["pr_url"] or "",
+            "report": report}
+
+
+def command(args: list[str]) -> list[str]:
+    return paths.cli_command(*args)
+
+
+def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
+    return launch(command(args), log_name, keep)
+
+
+def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
+    paths.ensure_dirs()
+    keep, env = launch_lease.child_environment(keep)
+    with open(paths.LOG_DIR / log_name, "a") as log:
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
+                                env={**env, "ARETE_ACTOR": principals.current(),
+                                     "ARETE_VIA": events.provenance() or ""})
+    launch_lease.passed()
+    threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
+    return proc
+
+
+def find_loop(name: str, cfg: config.Config | None = None) -> Loop:
+    try:
+        return loops.find(name, cfg)
+    except loops.LoopError as e:
+        raise NotFound(str(e)) from e
+
+
+def working_loop(name: str, cfg: config.Config | None = None) -> Loop:
+    loop = find_loop(name, cfg)
+    if loop.error:
+        raise Refused(f"{loop.name} is broken: {loop.error}")
+    return loop
+
+
+def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
+    r = writes.check_run(run_id, base_version, public=public)
+    if not r:
+        raise NotFound(f"no run {run_id}")
+    if r["status"] != "running":
+        raise Refused(f"{run_id} is not running; it ended {r['status']}")
+    with record.dead(r) as gone:
+        if gone:
+            if not (r := record.ask_stop(run_id, base_version)):
+                raise NotFound(f"no run {run_id}")
+            if r["status"] != "running":
+                raise Refused(f"{run_id} is not running; it ended {r['status']}")
+            devices.release(run_id, lambda text: run_store.add_feed(run_id, "device", text))
+            if r["kind"] in record.TICKET_KINDS:
+                return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
+            record.interrupt(r, devices.left_up(run_id))
+            return {"id": run_id, "stopped": True, "was": "gone"}
+    if not r["pid"]:
+        raise Refused(f"{run_id} is still starting; stop it again in a moment")
+    r = record.ask_stop(run_id, base_version) or r
+    if r["status"] != "running":
+        raise Refused(f"{run_id} is not running; it ended {r['status']}")
+    pid = int(r["pid"])
+    for kill in (os.killpg, os.kill):
+        try:
+            kill(pid, signal.SIGTERM)
+            break
+        except (ProcessLookupError, PermissionError):
+            continue
+    else:
+        raise Refused(f"could not signal run {run_id}; its stop request remains recorded")
+    return {"id": run_id, "stopped": True, "pid": pid}
+
+
+def database_beat() -> dict:
+    return util.read_json(paths.DB_FILE.with_name(BEAT_FILE.name), {})
+
+
+def serve_beat() -> dict:
+    data = util.read_json(BEAT_FILE, {})
+    if data.get("at"):
+        data["age_seconds"] = round((util.now() - util.parse_iso(data["at"])).total_seconds())
+        data["process_gone"] = not util.pid_alive(data.get("pid"))
+        data["alive"] = not data["process_gone"] and data["age_seconds"] < BEAT_STALE_SECONDS
+        data["stuck"] = any(f.get("ticks", 0) >= STUCK_TICKS for f in (data.get("failing") or {}).values())
+    return data
+
+
+def day_ago() -> str:
+    return util.iso(util.now() - timedelta(days=1))
+
+
+def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> list[dict]:
+    cfg = cfg or config.load_or_problem()[0]
+    every_loop = loops.load_all(cfg)
+    states = loop_store.loop_states(connect)
+    running = {r["loop"]: r["id"] for r in run_store.runs_marked_running(connect) if r["kind"] == "loop"}
+    waiting = Counter(item["loop"] for item in loop_store.pending(connect))
+    dead = Counter(item["loop"] for item in loop_store.dead_items(connect))
+    spent: dict[str, float] = defaultdict(float)
+    for s in run_store.steps_since(day_ago(), connect):
+        if billing_of(s, cfg.local_providers) == "api_key":
+            spent[s.get("loop") or ""] += s["cost_usd"] or 0
+    out = []
+    for loop in every_loop:
+        last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
+        st = states.get(loop.name) or {}
+        out.append({**loop.view(), "running": running.get(loop.name, ""), "pending": waiting[loop.name],
+                    "dead": dead[loop.name],
+                    "next_due": st.get("next_due") if loop.enabled else None, "last_fire": st.get("last_fire"),
+                    "spent_24h": round(spent[loop.name], 4),
+                    "last": {k: last[k] for k in ("id", "status", "started", "finished", "summary", "cost_usd",
+                                                  "trigger")} if last else None})
+    return out
+
+
+def loop_detail(name: str, connect=foundation.reader) -> dict:
+    cfg = config.load_or_problem()[0]
+    loop = find_loop(name, cfg)
+    view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
+    source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
+    runs = run_store.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
+    paid = run_store.paid_by_run([r["id"] for r in runs], connect)
+    return {**view, "prompt": loops.prompt_text(loop), "state": loop_store.loop_state(loop.name, connect)["data"],
+            "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
+            "findings": loop_store.findings(loop.name, 40, connect),
+            "waiting": [i for i in loop_store.pending(connect) if i["loop"] == loop.name],
+            "dead": [{k: v for k, v in i.items() if k != "loop"}
+                     for i in loop_store.dead_items(connect) if i["loop"] == loop.name],
+            "cursors": [c for c in source_store.cursors(connect) if c["source"] in source_ids],
+            "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
+            "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
+            "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
+
+
+def switch(name: str, enabled: bool) -> dict:
+    loop = working_loop(name) if enabled else find_loop(name)
+    loops.set_enabled(loop, enabled)
+    return {"name": loop.name, "enabled": enabled, "serve_up": bool(serve_beat().get("alive"))}
+
+
+def feed(run_id: str, after: int = 0) -> dict:
+    with foundation.one_read() as conn:
+        epoch = foundation.restore_epoch(conn)
+        lines = run_store.feed(run_id, after, connect=foundation.reader)
+        run_read_after_its_lines = run_store.run_get(run_id, connect=foundation.reader)
+    if not run_read_after_its_lines:
+        raise NotFound(f"no run {run_id}")
+    return {"run": run_read_after_its_lines, "lines": lines, "restore_epoch": epoch}
+
+
+def decide(approval_id: int, yes: bool) -> dict:
+    try:
+        return {"id": approval_id, "approved": yes, "result": delivery.decide(approval_id, yes)}
+    except LookupError as e:
+        raise NotFound(str(e)) from e
+    except delivery.KeptFailure as e:
+        raise KeptFailure(str(e)) from e
+    except (ValueError, delivery.Failed) as e:
+        raise Refused(str(e)) from e
+
+
+def fleet() -> list[dict]:
+    try:
+        return devices.views()
+    except devices.DeviceError as e:
+        return [{**devices.LOCAL.view(), "probe": None, "error": str(e)}]
+
+
+def cost_window(days: float | None) -> tuple[float, str]:
+    days = COST_DAYS if days is None else days
+    if days < 0:
+        raise Refused("--days must be 0 or more")
+    try:
+        return days, util.iso(util.now() - timedelta(days=days))
+    except (OverflowError, ValueError) as e:
+        raise Refused(f"cannot look back {days:g} days: {e}") from e
+
+
+def costs(days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None) -> dict:
+    days, since = cost_window(days)
+    by_route = step_costs("route", days, connect, cfg, since=since)["groups"]
+    return {"days": days, **paid_since(since, connect, cfg), "by_route": by_route}
+
+
+def route_of(step: dict, cfg: config.Config) -> dict:
+    which, model, billing = step.get("runner") or "", step.get("model") or "", billing_of(step, cfg.local_providers)
+    fallback = {"claude": "anthropic", "codex": "openai" if step.get("auth_mode") == "api_key" else "chatgpt",
+                "pi": model.partition("/")[0] if "/" in model else ""}.get(which, "")
+    provider = step.get("provider") or fallback
+    return {"runner": which, "provider": provider, "model": model, "billing": billing,
+            "name": f"{which or 'no runner'}/{provider or '-'}/{model or 'no model'}/{billing}"}
+
+
+def step_costs(by: str, days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None, *,
+              since: str | None = None) -> dict:
+    if by not in COST_GROUPS:
+        raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
+    if since is None:
+        days, since = cost_window(days)
+    cfg = cfg or config.load_or_problem()[0]
+    groups: dict[str, dict] = {}
+    paid = subscribed = 0.0
+    for s in run_store.steps_since(since, connect):
+        route = route_of(s, cfg)
+        name = route["name"] if by == "route" else s[STEP_FIELD_OF[by]] or f"no {by}"
+        row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_usd": 0.0,
+                                       "paid_usd": 0.0, "subscription_usd": 0.0,
+                                       **({k: route[k] for k in ("runner", "provider", "model", "billing")}
+                                          if by == "route" else {}),
+                                       **dict.fromkeys(TOKEN_FIELDS, 0), "minutes": 0.0, "api_minutes": 0.0})
+        local = route["billing"] == "local"
+        cost = 0 if local or route["billing"] == "replay" else s["cost_usd"] or 0
+        side = "subscription_usd" if route["billing"] == "subscription" else "paid_usd"
+        row["runs"].add(s["run_id"])
+        row["calls"] += 1
+        row["cost_usd"] += cost
+        row[side] += cost
+        if side == "paid_usd":
+            paid += cost
+        else:
+            subscribed += cost
+        for f in TOKEN_FIELDS:
+            row[f] += s.get(f) or 0
+        row["minutes"] += (s["seconds"] or 0) / 60
+        row["api_minutes"] += (s.get("api_seconds") or 0) / 60
+    out = [{**r, "runs": len(r["runs"]), "cost_usd": round(r["cost_usd"], 4), "paid_usd": round(r["paid_usd"], 4),
+            "subscription_usd": round(r["subscription_usd"], 4), "minutes": round(r["minutes"], 2),
+            "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
+    waits = dict.fromkeys(run_lines.WAIT_CAUSES, 0.0)
+    for r in run_store.runs_since(since, connect):
+        try:
+            recorded = json.loads(r.get("wait_minutes") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(recorded, dict):
+            continue
+        for cause in waits:
+            if type(recorded.get(cause)) in (int, float):
+                waits[cause] += recorded[cause]
+    return {"days": days, "since": since, "by": by, "paid_usd": round(paid, 4),
+            "subscription_usd": round(subscribed, 4),
+            "groups": sorted(out, key=lambda r: (-r["cost_usd"], -r["calls"], r["name"])),
+            "wait_minutes": {cause: round(minutes, 2) for cause, minutes in waits.items()}}
+
+
+def wilson(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if not n:
+        return 0.0, 1.0
+    p = hits / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def rate_difference(arm: tuple[int, int], base: tuple[int, int]) -> tuple[float, float, float]:
+    p1, p2 = arm[0] / arm[1] if arm[1] else 0.0, base[0] / base[1] if base[1] else 0.0
+    (l1, u1), (l2, u2) = wilson(*arm), wilson(*base)
+    d = p1 - p2
+    return d, d - math.sqrt((p1 - l1) ** 2 + (u2 - p2) ** 2), d + math.sqrt((u1 - p1) ** 2 + (p2 - l2) ** 2)
+
+
+def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, connect, cfg: config.Config) -> dict:
+    runs = [r for repo, issue in tickets for r in run_store.ticket_runs_since(repo, issue, since, connect)]
+    merged = {(r["repo"], r["issue"]) for r in runs if r["status"] == "merged"}
+    rows = [(r["id"], s) for r in runs for s in steps_by_run.get(r["id"], ())]
+    cost = {"api_key": 0.0, "subscription": 0.0}
+    for _, s in rows:
+        billing = billing_of(s, cfg.local_providers)
+        if billing in cost:
+            cost[billing] += s["cost_usd"] or 0
+
+    def counted(atoms: tuple[str, ...]) -> int:
+        return len({(run_id, s["step"], s["try"]) for run_id, s in rows if s.get("atom") in atoms})
+
+    def per(total: float) -> float | None:
+        return round(total / len(merged), 4) if merged else None
+
+    return {"tickets": len(tickets), "runs": len(runs), "merged": len(merged),
+            "no_pr": sum(1 for r in runs if r["status"] != "running" and not r["pr_url"]),
+            "repairs": counted(REPAIRS), "review_rounds": counted(("review",)),
+            "paid_usd": round(cost["api_key"], 4), "subscription_usd": round(cost["subscription"], 4),
+            "paid_per_merged": per(cost["api_key"]), "subscription_per_merged": per(cost["subscription"]),
+            "merge_rate": round(len(merged) / len(tickets), 4) if tickets else 0.0}
+
+
+def ab_report(name: str = "", days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None) -> list[dict]:
+    days, since = cost_window(AB_DAYS if days is None else days)
+    cfg = cfg or config.load_or_problem()[0]
+    placed: dict[str, dict] = {}
+    for p in run_store.ab_placements(since, name, connect):
+        test = placed.setdefault(p["ab"], {"step": p["atom"], "arm": set(), "baseline": set()})
+        if p["ab_side"] in ("arm", "baseline"):
+            test[p["ab_side"]].add((p["repo"], p["issue"]))
+    steps_by_run: dict[str, list[dict]] = defaultdict(list)
+    for s in run_store.steps_since(since, connect):
+        steps_by_run[s["run_id"]].append(s)
+    report = []
+    for ab, test in sorted(placed.items()):
+        sides = {side: ab_side(test[side], steps_by_run, since, connect, cfg) for side in ("arm", "baseline")}
+        d, lo, hi = rate_difference(*((sides[s]["merged"], sides[s]["tickets"]) for s in ("arm", "baseline")))
+        report.append({"ab": ab, "step": test["step"], "days": days, "since": since, "sides": sides,
+                       "merge_rate_difference": round(d, 4), "interval": [round(lo, 4), round(hi, 4)],
+                       "too_few": min(s["tickets"] for s in sides.values()) < AB_MIN_TICKETS})
+    return report
+
+
+def paid_since(since: str, connect=foundation.reader, cfg: config.Config | None = None) -> dict:
+    groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
+    total = 0.0
+    cfg = cfg or config.load_or_problem()[0]
+    for s in run_store.steps_since(since, connect):
+        if billing_of(s, cfg.local_providers) != "api_key":
+            continue
+        cost = s["cost_usd"] or 0
+        total += cost
+        keys = {"model": s["model"] or "no model", "runner": s["runner"] or "no runner",
+                "loop": s.get("loop") or s.get("kind") or s.get("run_id") or "no loop",
+                "day": util.parse_iso(s["ts"]).astimezone().strftime("%Y-%m-%d")}
+        for group, key in keys.items():
+            row = groups[group].setdefault(key, {"name": key, "cost_usd": 0.0, "steps": 0, "tokens_in": 0,
+                                                 "tokens_out": 0})
+            row["cost_usd"] += cost
+            row["steps"] += 1
+            row["tokens_in"] += s["tokens_in"] or 0
+            row["tokens_out"] += s["tokens_out"] or 0
+    return {"since": since, "total_usd": round(total, 4),
+            **{f"by_{group}": sorted(({**r, "cost_usd": round(r["cost_usd"], 4)} for r in rows.values()),
+                                     key=lambda r: (-r["cost_usd"], r["name"])) for group, rows in groups.items()}}

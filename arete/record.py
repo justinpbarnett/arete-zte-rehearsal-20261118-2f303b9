@@ -1,0 +1,931 @@
+from __future__ import annotations
+
+import contextlib
+import gzip
+import itertools
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import sys
+import threading
+import time
+import zlib
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Self
+
+from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
+from .store import approvals as approvals_store
+from .store import db as foundation
+from .store import loops as loop_store
+from .store import runs as run_store
+
+SETTLE_GRACE_SECONDS = 60
+INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
+STOPPED = "stopped by request"
+ID_PREFIX = {"pipeline": "pip", "miner": "min", "eval": "eva", "experiment": "exp"}
+FAILS_WHEN_DEAD = ("miner", "eval")
+TICKET_KINDS = ("pipeline",)
+RECORD_SUFFIX = ".jsonl.gz"
+TIMELINE = f"steps{RECORD_SUFFIX}"
+CLOCK_SECONDS = 1
+HEADER_WAIT_SECONDS = 10
+
+
+def new_id(prefix: str, tag: str = "") -> str:
+    stamp = util.now().strftime("%Y%m%d-%H%M%S")
+    return "-".join(filter(None, [prefix.replace("/", "."), stamp, os.urandom(2).hex(), tag]))
+
+
+def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
+    nested = foundation.in_write()
+    row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
+           "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
+    if kind in TICKET_KINDS:
+        row.update(active_seconds=0, verify_seconds=0, verify_open_seconds=0, repair_calls=0,
+                   measured_at=row["started"])
+    while True:
+        minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
+        try:
+            run_store.insert_run(minted, row)
+        except sqlite3.IntegrityError as e:
+            if run_id or "runs.id" not in str(e):
+                raise
+            continue
+        # A nested writer has not committed yet; retain its lease until exit.
+        if kind in TICKET_KINDS and not nested:
+            launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
+        return minted
+
+
+def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
+         try_no: int = 0, auth_mode: str = "") -> None:
+    steps(run_id, name, [(res, seconds)], effort, tier, kind, try_no, auth_mode)
+
+
+def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
+          try_no: int = 0, auth_mode: str = "") -> None:
+    run_store.insert_steps(run_id, name, calls, effort, tier, kind, try_no, auth_mode)
+
+
+def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") -> None:
+    if not math.isfinite(usd) or not why.strip():
+        raise ValueError("correction needs a finite amount and a reason")
+    if auth_mode not in ("subscription", "api_key", "local"):
+        raise ValueError("invalid auth mode")
+    if not run_store.run_get(run_id):
+        raise ValueError(f"no run: {run_id}")
+    step(run_id, "correction", agent.Result(ok=True, runner="correction", cost_usd=usd, error=why,
+                                           auth_mode=auth_mode), 0, kind="correction")
+
+
+def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
+    run_store.label_step(run_id, step, try_no, **labels)
+
+
+def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
+    run_store.hold_ab(run_id, role, name, side, arm)
+
+
+def metered_spent(run_id: str) -> float:
+    return run_store.paid_by_run([run_id]).get(run_id, 0.0)
+
+
+def note(run_id: str, *, base_version=None, **fields) -> None:
+    if "status" in fields:
+        raise ValueError("use move to change a run\'s status")
+    run_store.note(run_id, base_version=base_version, **fields)
+
+
+def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **fields) -> bool:
+    return run_store.move(run_id, to, expect, base_version=base_version, **fields)
+
+
+def ask_stop(run_id: str, base_version=None) -> dict | None:
+    return run_store.ask_stop(run_id, base_version)
+
+
+class Stopped(Exception):
+    pass
+
+
+def stop_on_term(*_) -> None:
+    raise Stopped
+
+
+@contextmanager
+def stoppable() -> Iterator[None]:
+    signal.signal(signal.SIGTERM, stop_on_term)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+def stop_asked(run_id: str) -> bool:
+    r = run_store.run_get(run_id)
+    return bool(r and r["stop_asked"])
+
+
+def settle(run_id: str, status: str, end_line: str = "", *, base_version=None, **fields) -> dict | None:
+    fields = {"status": status, "finished": util.iso(), **fields}
+    settled = run_store.settle(run_id, fields, end_line, base_version)
+    if settled is None:
+        return None
+    mark(run_id, "result", at=fields.pop("finished"), **fields)
+    return settled
+
+
+@contextmanager
+def failed_on_crash(run_id: str):
+    try:
+        yield
+    except BaseException as e:
+        why = util.first_line(f"crashed: {type(e).__name__}: {e}", 300)
+        settle(run_id, "failed", end_line=f"failed: {why}", summary=why)
+        raise
+
+
+def dead_status(row: dict) -> str:
+    if stop_asked(row["id"]):
+        return "stopped"
+    if row.get("only_step"):
+        return "interrupted"
+    if row["kind"] == "pipeline":
+        earlier = [r for r in run_store.ticket_runs(row["repo"], row["issue"], limit=3, whole=True) if r["id"] != row["id"]]
+        return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"
+    return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
+
+
+@contextmanager
+def dead(row: dict):
+    if not row.get("lock"):
+        yield not util.pid_alive(row.get("pid"))
+    elif util.lock_is_held(row["lock"]):
+        yield False
+    else:
+        with util.lock(row["lock"]) as free:
+            yield free
+
+
+def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dict | None:
+    status = dead_status(row)
+    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
+    settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
+    if settled and not util.pid_alive(row.get("pid")):
+        util.end_session(row.get("pid"))
+    if settled and row["kind"] == "draft":
+        shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)
+    return settled
+
+
+def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:
+    settled = []
+    for row in run_store.runs_marked_running():
+        if ((row["kind"] in TICKET_KINDS) != tickets
+                or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS):
+            continue
+        with dead(row) as gone:
+            if gone and (done := interrupt(row)):
+                then(done)
+                settled.append(done)
+    if not tickets:
+        loop_store.release_settled_claims()
+    return settled
+
+
+def slug(step: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", step).strip("-.") or "agent"
+
+
+def fresh_record(folder: Path, name: str) -> tuple[Path, int]:
+    folder.mkdir(parents=True, exist_ok=True)
+    for n in itertools.count(1):
+        path = folder / f"{name if n == 1 else f'{name}-{n}'}{RECORD_SUFFIX}"
+        if path.name == TIMELINE:
+            continue
+        try:
+            return path, os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            continue
+    raise AssertionError("unreachable")
+
+
+def append(fd: int, text: str) -> None:
+    os.write(fd, gzip.compress(f"{text}\n".encode(errors="replace")))
+
+
+class Recorder:
+    def __init__(self, run_id: str, step: str, header: dict, hidden: Sequence[str]):
+        self.run_id, self.step, self.hidden = run_id, step, hidden
+        self.runner, self.model = header.get("runner", ""), header.get("model", "")
+        self.lock = threading.RLock()
+        self.at, self.started = util.iso(), time.monotonic()
+        self.clocked, self.ended = self.started, False
+        self.header = {"arete": "header", **header, "engine": codebase.STAMP, "run_id": run_id, "step": step, "started": self.at}
+        self.held: list[str] | None = []
+        self.waiting = threading.Timer(HEADER_WAIT_SECONDS, self.release)
+        self.waiting.daemon = True
+        self.path: Path | None = None
+        self.fd: int | None = None
+        try:
+            self.path, self.fd = fresh_record(paths.record_dir(run_id), slug(step))
+        except OSError as e:
+            self.fail(e)
+        if self.model or self.fd is None:
+            self.release()
+        else:
+            self.waiting.start()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, kind, error, trace) -> None:
+        if error is not None:
+            why = self.exception_text(error)
+            self.end({"ok": False, "error": why, "seconds": self.elapsed()})
+        self.close()
+
+    def exception_text(self, error: BaseException) -> str:
+        return STOPPED if self.stop_requested(error) else f"crashed: {failure(error)}"
+
+    def stop_requested(self, error: BaseException) -> bool:
+        if isinstance(error, KeyboardInterrupt):
+            return True
+        try:
+            return stop_asked(self.run_id)
+        except sqlite3.Error:
+            return False
+
+    def elapsed(self) -> float:
+        return round(time.monotonic() - self.started, 1)
+
+    def line(self, raw: str) -> None:
+        raw = raw.rstrip("\r\n")
+        if not raw.strip():
+            return
+        with self.lock:
+            clock = []
+            if time.monotonic() - self.clocked >= CLOCK_SECONDS:
+                self.clocked = time.monotonic()
+                clock.append(json.dumps({"arete": "clock", "seconds": self.elapsed()}))
+            text = "\n".join([*clock, scrub.scrub(raw, self.hidden)])
+            if self.held is None:
+                self.put(text)
+                return
+            self.held.append(text)
+            if model := named_model(raw):
+                self.model = self.header["model"] = model
+                self.release()
+
+    def release(self) -> None:
+        with self.lock:
+            if self.held is None:
+                return
+            held, self.held = self.held, None
+            self.waiting.cancel()
+            self.write(self.header)
+            for text in held:
+                self.put(text)
+
+    def finish(self, res: agent.Result, seconds: float) -> None:
+        self.end({"ok": res.ok, "error": res.error, "text": res.text, "structured": res.structured,
+                  "cost_usd": res.cost_usd, "tokens_in": res.tokens_in, "tokens_out": res.tokens_out,
+                  "first_context_tokens": res.first_context_tokens, "turns": res.turns, "model": res.model,
+                  "provider": res.provider, "runner": res.runner, "auth_mode": res.auth_mode,
+                  "auth_modes": list(res.modes), "paid_usd": res.paid_usd, "credential": res.credential,
+                  "effort": res.effort, "requested_effort": res.requested_effort, "skipped": res.skipped,
+                  "cache_read": res.cache_read, "cache_write": res.cache_write,
+                  "reference_usd": res.reference_usd, "quote": res.quote,
+                  **({"calls": [{"runner": c.runner, "model": c.model, "provider": c.provider,
+                                "auth_mode": c.auth_mode, "cost_usd": c.cost_usd, "paid_usd": c.paid_usd,
+                                "tokens_in": c.tokens_in, "tokens_out": c.tokens_out,
+                                "cache_read": c.cache_read, "cache_write": c.cache_write, "turns": c.turns,
+                                "reference_usd": c.reference_usd, "quote": c.quote} for c in res.calls]}
+                     if res.calls else {}),
+                  "session": res.session.id, "seconds": round(seconds, 1)})
+
+    def end(self, result: dict) -> None:
+        if self.ended:
+            return
+        self.ended = True
+        result = {"runner": self.runner, "model": self.model, "provider": self.header.get("provider", ""),
+                  "auth_mode": self.header.get("auth_mode", ""), **result}
+        self.release()
+        self.write({"arete": "result", **result})
+        self.close()
+        mark(self.run_id, "agent", at=self.at, step=self.step, record=self.path.name if self.path else "",
+             runner=self.runner, model=result.get("model") or self.model, ok=result["ok"],
+             auth_mode=result["auth_mode"], provider=result.get("provider", self.header.get("provider", "")),
+             **({"atom": self.header["atom"]} if self.header.get("atom") else {}),
+             **{k: result[k] for k in ("auth_modes", "paid_usd", "credential", "effort") if k in result},
+             seconds=result["seconds"], **{k: result[k] for k in ("cost_usd", "turns") if k in result},
+             **({"error": util.first_line(scrub.scrub(result["error"], self.hidden), 300)} if result["error"] else {}))
+
+    def write(self, entry: dict) -> None:
+        with self.lock:
+            self.put(scrub.scrub(json.dumps(entry, ensure_ascii=False, default=str), self.hidden))
+
+    def put(self, text: str) -> None:
+        if self.fd is None:
+            return
+        try:
+            append(self.fd, text)
+        except OSError as e:
+            self.fail(e)
+
+    def fail(self, e: OSError) -> None:
+        print(f"{util.iso()} stopped recording {self.run_id} {self.step}: {e}", file=sys.stderr, flush=True)
+        self.close()
+
+    def close(self) -> None:
+        with self.lock:
+            self.release()
+            fd, self.fd = self.fd, None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+
+def mark(run_id: str, kind: str, **fields) -> None:
+    if not run_id:
+        return
+    text = scrub.scrub(json.dumps({"kind": kind, "at": util.iso(), **fields}, ensure_ascii=False, default=str),
+                       scrub.secrets())
+    folder = paths.record_dir(run_id)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        fd = os.open(folder / TIMELINE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            append(fd, text)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"{util.iso()} could not mark {kind} for {run_id}: {e}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def timed(run_id: str, kind: str, **detail):
+    at, started = util.iso(), time.monotonic()
+    try:
+        yield detail
+    except BaseException as e:
+        detail["error"] = failure(e)
+        raise
+    finally:
+        mark(run_id, kind, at=at, **detail, seconds=round(time.monotonic() - started, 2))
+
+
+def failure(e: BaseException) -> str:
+    return ": ".join(filter(None, [type(e).__name__, util.first_line(str(e), 300)]))
+
+
+def record_files(run_id: str) -> list[Path]:
+    found = [f for f in paths.record_dir(run_id).glob(f"*{RECORD_SUFFIX}") if f.name != TIMELINE]
+    return sorted(found, key=lambda f: f.stat().st_mtime)
+
+
+def find_record(run_id: str, step: str) -> Path | None:
+    folder = paths.record_dir(run_id)
+    for name in (step, f"{step}{RECORD_SUFFIX}", f"{slug(step)}{RECORD_SUFFIX}"):
+        if name != TIMELINE and (folder / name).is_file():
+            return folder / name
+    return None
+
+
+class AppendedLines:
+    def __init__(self, path: Path, compressed: bool = True):
+        self.path, self.offset, self.pending = path, 0, b""
+        self.decoder = zlib.decompressobj(wbits=31) if compressed else None
+        self.failed = False
+
+    def read(self) -> Iterator[str]:
+        if self.failed:
+            return
+        try:
+            f = self.path.open("rb")
+        except FileNotFoundError:
+            return
+        with f:
+            f.seek(self.offset)
+            while chunk := f.read(64 * 1024):
+                self.offset += len(chunk)
+                while chunk:
+                    if self.decoder is not None:
+                        if self.decoder.eof:
+                            self.decoder = zlib.decompressobj(wbits=31)
+                        try:
+                            data = self.decoder.decompress(chunk)
+                        except zlib.error:
+                            self.failed = True
+                            return
+                        chunk = self.decoder.unused_data
+                    else:
+                        data, chunk = chunk, b""
+                    self.pending += data
+                    complete = self.pending.split(b"\n")
+                    self.pending = complete.pop()
+                    for line in complete:
+                        if line.strip():
+                            yield line.decode(errors="replace")
+
+
+def raw_lines(path: Path) -> Iterator[str]:
+    yield from AppendedLines(path).read()
+
+
+def run_status(run_id: str) -> str:
+    try:
+        row = run_store.run_get(run_id, connect=foundation.reader)
+    except sqlite3.Error:
+        return ""
+    return (row.get("status") or "") if row else ""
+
+
+def follow(run_id: str, step: str) -> Iterator[str]:
+    path = find_record(run_id, step)
+    if not path and (step in ("steps", TIMELINE) or run_status(run_id) != "running"):
+        raise FileNotFoundError(step)
+    source = AppendedLines(path) if path else None
+    timeline = AppendedLines(paths.record_dir(run_id) / TIMELINE)
+    report = AppendedLines(run_lines.path(run_id), compressed=False)
+    ended = False
+    while True:
+        if source is None and (path := find_record(run_id, step)):
+            source = AppendedLines(path)
+        if source is not None:
+            with contextlib.closing(source.read()) as available:
+                for line in available:
+                    result = next(entries([line]), {}).get("arete") == "result"
+                    yield line
+                    if result:
+                        return
+        if ended:
+            if source is None:
+                raise FileNotFoundError(step)
+            return
+        status = run_status(run_id)
+        ended = bool(status and status != "running")
+        for entry in entries(timeline.read()):
+            ended |= entry.get("kind") == "result"
+        for entry in entries(report.read()):
+            ended |= entry.get("event") == run_lines.END
+        if not ended:
+            time.sleep(run_lines.FOLLOW_POLL_SECONDS)
+
+
+def lines(path: Path) -> Iterator[dict]:
+    yield from entries(raw_lines(path))
+
+
+def entries(source: Iterable[str]) -> Iterator[dict]:
+    for line in source:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            yield entry
+
+
+def events(path: Path) -> Iterator[dict]:
+    yield from normalized(lines(path))
+
+
+def numbered_events(path: Path) -> Iterator[dict]:
+    number = 0
+
+    def numbered() -> Iterator[dict]:
+        nonlocal number
+        for number, raw in enumerate(raw_lines(path), 1):
+            yield from entries([raw])
+
+    for event in normalized(numbered()):
+        yield {**event, "line": number}
+
+
+def runs_since(since: str, until: str = "9999") -> list[dict]:
+    return run_store.finished_runs_since(since, until)
+
+
+def read_run(run_id: str) -> dict | None:
+    row = run_store.run_get(run_id)
+    if not row:
+        return None
+    try:
+        marks = list(lines(paths.record_dir(run_id) / TIMELINE))
+    except OSError:
+        marks = []
+    try:
+        parked = util.read_json(paths.RUNS_DIR / run_id / "parked.json", {})
+    except OSError:
+        parked = {}
+    try:
+        waited = sum(run_lines.wait_minutes(run_id).values())
+    except OSError:
+        waited = 0
+    rows = run_store.steps(run_id)
+    tries: dict[str, int] = {}
+    for r in rows:
+        tries[r["step"]] = max(tries.get(r["step"], 0), r["try"] or 0)
+    try:
+        seconds = (util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds()
+    except (TypeError, ValueError):
+        seconds = 0
+    return {
+        "id": run_id, "kind": row["kind"], "repo": row["repo"], "issue": row["issue"], "status": row["status"],
+        "summary": row["summary"], "started": row["started"], "finished": row["finished"],
+        "seconds": max(0, seconds), "wait_minutes": waited,
+        "parked": str(parked.get("reason") or "") if isinstance(parked, dict) else "",
+        "marks": marks,
+        "calls": [{"step": m.get("step", ""), "record": m.get("record", ""), "runner": m.get("runner", ""),
+                   "model": m.get("model", ""), "ok": bool(m.get("ok")), "error": m.get("error", ""),
+                   "seconds": m.get("seconds") or 0} for m in marks if m.get("kind") == "agent"],
+        "tries": tries,
+        "failed_steps": [{"step": r["step"], "try": r["try"], "error": r["error"], "kind": r["kind"]}
+                         for r in rows if not r["ok"]],
+    }
+
+
+def last_message(path: Path, notice: re.Pattern[str] | None = None) -> str:
+    found = ""
+    try:
+        for event in events(path):
+            text = str(event.get("text") or "").strip()
+            if (event.get("kind") == "message" and event.get("role") == "assistant" and text
+                    and not (notice and notice.search(text))):
+                found = text
+    except OSError:
+        return ""
+    return found
+
+
+def normalized(source: Iterable[dict]) -> Iterator[dict]:
+    seconds, read = 0.0, unread
+    for line in source:
+        own = line.pop("arete", None)
+        if own == "clock":
+            seconds = line.get("seconds", seconds)
+        elif own in ("header", "result", "attach", "lost"):
+            if own == "header":
+                read = READERS.get(line.get("runner"), lambda header: unread)(line)
+            yield {"kind": own, "seconds": seconds, **line}
+        elif not own:
+            for event in read(line):
+                yield {**event, "seconds": seconds}
+
+
+def unread(event: dict) -> list[dict]:
+    return []
+
+
+def blocks(content) -> list[dict]:
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def block_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text", "") for b in blocks(content) if b.get("type") == "text")
+
+
+def claude_reader(header: dict) -> Callable[[dict], list[dict]]:
+    tool_names: dict[str, str] = {}
+    counted: set[str] = set()
+    resumed = header.get("resume") if isinstance(header.get("resume"), dict) else {}
+    spent_before = float(resumed.get("spent_usd") or 0)
+
+    def read(e: dict) -> list[dict]:
+        message = e.get("message") if isinstance(e.get("message"), dict) else {}
+        out = []
+        if e.get("type") == "assistant":
+            for b in blocks(message.get("content")):
+                if b.get("type") == "text":
+                    out.append({"kind": "message", "role": "assistant", "text": b.get("text", "")})
+                elif b.get("type") == "thinking":
+                    out.append({"kind": "message", "role": "thinking", "text": b.get("thinking", "")})
+                elif b.get("type") == "tool_use":
+                    tool_names[b.get("id", "")] = b.get("name", "")
+                    out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
+                                "input": b.get("input")})
+            if isinstance(usage := message.get("usage"), dict) and message.get("id") not in counted:
+                counted.add(message.get("id"))
+                out.append({"kind": "usage", "model": message.get("model", ""), **agent.claude_tokens(usage),
+                            "cost_usd": None})
+        elif e.get("type") == "user":
+            if isinstance(message.get("content"), str):
+                out.append({"kind": "message", "role": "user", "text": message["content"]})
+            for b in blocks(message.get("content")):
+                if b.get("type") == "tool_result":
+                    out.append({"kind": "tool_result", "id": b.get("tool_use_id", ""),
+                                "name": tool_names.get(b.get("tool_use_id", ""), ""),
+                                "text": block_text(b.get("content")), "error": bool(b.get("is_error"))})
+                elif b.get("type") == "text":
+                    out.append({"kind": "message", "role": "user", "text": b.get("text", "")})
+        elif e.get("type") == "result":
+            session_cost = e.get("total_cost_usd")
+            out.append({"kind": "usage", "total": True, "model": next(iter(e.get("modelUsage") or {}), ""),
+                        **agent.claude_tokens(e.get("usage") or {}),
+                        "cost_usd": None if session_cost is None else max(0.0, float(session_cost) - spent_before)})
+        return out
+
+    return read
+
+
+def read_pi(e: dict) -> list[dict]:
+    message = e.get("message") if isinstance(e.get("message"), dict) else {}
+    if e.get("type") != "message_end":
+        return []
+    if message.get("role") == "toolResult":
+        return [{"kind": "tool_result", "id": message.get("toolCallId", ""), "name": message.get("toolName", ""),
+                 "text": block_text(message.get("content")), "error": bool(message.get("isError"))}]
+    if message.get("role") == "user":
+        return [{"kind": "message", "role": "user", "text": block_text(message.get("content"))}]
+    if message.get("role") != "assistant":
+        return []
+    out = []
+    for b in blocks(message.get("content")):
+        if b.get("type") == "text":
+            out.append({"kind": "message", "role": "assistant", "text": b.get("text", "")})
+        elif b.get("type") == "thinking":
+            out.append({"kind": "message", "role": "thinking", "text": b.get("thinking", "")})
+        elif b.get("type") == "toolCall":
+            out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
+                        "input": b.get("arguments")})
+    if isinstance(usage := message.get("usage"), dict):
+        totals, provider = agent.usage_totals([usage]), message.get("provider", "")
+        out.append({"kind": "usage",
+                    "model": f"{provider}/{message.get('model')}" if provider else message.get("model", ""),
+                    "tokens_in": totals["tokens_in"], "tokens_out": totals["tokens_out"],
+                    "cost_usd": totals["cost_usd"]})
+    return out
+
+
+def mcp_call(item: dict) -> dict:
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            pass
+    return {"kind": "tool_call", "id": item.get("id", ""), "name": f"mcp__{item.get('server', '')}__{item.get('tool', '')}",
+            "input": arguments}
+
+
+def mcp_result(item: dict, name: str) -> dict:
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    failure = item.get("error")
+    text = block_text(result.get("content")) or (str(failure.get("message") if isinstance(failure, dict) else failure or ""))
+    return {"kind": "tool_result", "id": item.get("id", ""), "name": name, "text": text,
+            "error": bool(failure) or item.get("status") == "failed"}
+
+
+def codex_reader(header: dict) -> Callable[[dict], list[dict]]:
+    before: dict = {}
+    started: set[str] = set()
+
+    def read(e: dict) -> list[dict]:
+        nonlocal before
+        if e.get("arete") == "command":
+            before = e.get("usage_before") or {}
+            return []
+        item = e.get("item") if isinstance(e.get("item"), dict) else {}
+        kind, at = item.get("type"), item.get("id", "")
+        if e.get("type") == "turn.completed" and isinstance(usage := e.get("usage"), dict):
+            return [{"kind": "usage", "total": True, "model": header.get("model", ""),
+                     "tokens_in": max(0, int(usage.get("input_tokens") or 0) - int(before.get("input_tokens") or 0)),
+                     "tokens_out": max(0, int(usage.get("output_tokens") or 0) - int(before.get("output_tokens") or 0)),
+                     "cost_usd": None}]
+        if e.get("type") == "item.started" and kind == "command_execution":
+            return [{"kind": "tool_call", "id": at, "name": "Bash", "input": {"command": item.get("command", "")}}]
+        if e.get("type") == "item.started" and kind == "mcp_tool_call":
+            started.add(at)
+            return [mcp_call(item)]
+        if e.get("type") != "item.completed":
+            return []
+        if kind == "mcp_tool_call":
+            call = mcp_call(item)
+            return [*([] if at in started else [call]), mcp_result(item, call["name"])]
+        if kind in ("agent_message", "reasoning"):
+            role = "assistant" if kind == "agent_message" else "thinking"
+            return [{"kind": "message", "role": role, "text": item.get("text", "")}]
+        if kind == "command_execution":
+            return [{"kind": "tool_result", "id": at, "name": "Bash", "text": item.get("aggregated_output", ""),
+                     "error": item.get("exit_code") not in (0, None)}]
+        if kind == "file_change":
+            return [{"kind": "tool_call", "id": at, "name": "apply_patch", "input": {"changes": item.get("changes")}}]
+        return []
+
+    return read
+
+
+def read_replay(e: dict) -> list[dict]:
+    if e.get("type") == "tool_call":
+        return [{"kind": "tool_call", "id": e.get("id", ""), "name": e.get("name", ""), "input": e.get("input")}]
+    if e.get("type") == "tool_result":
+        return [{"kind": "tool_result", "id": e.get("id", ""), "name": e.get("name", ""), "text": e.get("text", ""),
+                 "error": bool(e.get("error"))}]
+    return []
+
+
+READERS: dict[str, Callable[[dict], Callable[[dict], list[dict]]]] = {"claude": claude_reader,
+                                                                      "pi": lambda header: read_pi,
+                                                                      "codex": codex_reader,
+                                                                      "replay": lambda header: read_replay}
+
+
+def named_model(raw: str) -> str:
+    try:
+        event = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(event, dict):
+        return ""
+    if event.get("type") == "system" and event.get("subtype") == "init":
+        return str(event.get("model") or "")
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    if message.get("role") != "assistant" or not message.get("model"):
+        return ""
+    return f"{message['provider']}/{message['model']}" if message.get("provider") else str(message["model"])
+
+
+GB = 10 ** 9
+LIVE_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class Stored:
+    run_id: str
+    size: int
+    written: float
+
+
+@dataclass(frozen=True)
+class Pruned:
+    removed: tuple[Stored, ...]
+    left: int
+    left_bytes: int
+    over: bool
+
+
+def scanned(run_id: str, folder: Path) -> Stored:
+    size, marks = 0, []
+
+    def failed(error: OSError) -> None:
+        raise error
+
+    for root, _, names in os.walk(folder, onerror=failed):
+        for name in names:
+            info = os.lstat(os.path.join(root, name))
+            size += info.st_size
+            marks.append(info.st_mtime)
+    return Stored(run_id, size, max(marks) if marks else folder.stat().st_mtime)
+
+
+def stored() -> list[Stored]:
+    try:
+        runs = sorted(paths.RUNS_DIR.iterdir())
+    except OSError:
+        return []
+    found = []
+    for run in runs:
+        folder = run / "record"
+        if run.is_symlink() or folder.is_symlink() or not folder.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            found.append(scanned(run.name, folder))
+    return sorted(found, key=lambda s: (s.written, s.run_id))
+
+
+def run_folders() -> list[Path]:
+    if not paths.RUNS_DIR.exists():
+        return []
+    return sorted(p for p in paths.RUNS_DIR.iterdir() if not p.is_symlink() and p.is_dir())
+
+
+def runs_bytes() -> int:
+    return sum(scanned(p.name, p).size for p in run_folders())
+
+
+@dataclass(frozen=True)
+class Purged:
+    folders: int
+    size: int
+    errors: tuple[str, ...]
+
+
+def legacy_firing(folder: Path) -> bool:
+    entries = {p.name: p for p in folder.iterdir()}
+    if "run.log" not in entries or set(entries) - {"run.log", "events.json", "scratch", "record"}:
+        return False
+    if any(p.is_symlink() for p in entries.values()):
+        return False
+    log = entries["run.log"]
+    if not log.is_file() or log.stat().st_mtime >= time.time() - 14 * 86400:
+        return False
+    if "events.json" in entries and not entries["events.json"].is_file():
+        return False
+    if "scratch" in entries and (not entries["scratch"].is_dir() or any(entries["scratch"].iterdir())):
+        return False
+    if "record" in entries:
+        if not entries["record"].is_dir():
+            return False
+        contents = list(entries["record"].iterdir())
+        if any(p.name != "steps.jsonl.gz" or p.is_symlink() or not p.is_file() for p in contents):
+            return False
+    return True
+
+
+def purge_folders() -> Purged:
+    queued, known = run_store.purge_inventory()
+    folders, size, errors = 0, 0, []
+    for run_id in sorted(queued):
+        folder = paths.RUNS_DIR / run_id
+        try:
+            if not one_component(run_id) or folder.is_symlink():
+                raise ValueError(f"unsafe run folder {run_id}")
+            if folder.exists():
+                measured = scanned(run_id, folder).size
+                shutil.rmtree(folder)
+                folders, size = folders + 1, size + measured
+            if not folder.exists():
+                run_store.forget_purge(run_id)
+        except (OSError, ValueError) as e:
+            errors.append(f"{run_id}: {type(e).__name__}: {e}")
+    for folder in run_folders():
+        if folder.name in known or folder.name in queued:
+            continue
+        try:
+            if legacy_firing(folder):
+                measured = scanned(folder.name, folder).size
+                shutil.rmtree(folder)
+                folders, size = folders + 1, size + measured
+        except OSError as e:
+            errors.append(f"{folder.name}: {type(e).__name__}: {e}")
+    return Purged(folders, size, tuple(errors))
+
+
+def kept(records: Sequence[Stored]) -> set[str]:
+    ids = [r.run_id for r in records]
+    recent = time.time() - LIVE_SECONDS
+    return (run_store.record_pins() | approvals_store.runs_cited_by_kept_proposals(ids)
+            | {r["id"] for r in run_store.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
+
+
+def prune(days: float, max_gb: float) -> Pruned:
+    records = stored()
+    protected = kept(records)
+    limit = max_gb * GB
+    oldest_allowed = time.time() - days * 86400
+    left_bytes, left, removed = runs_bytes(), len(records), []
+    for r in records:
+        if r.run_id in protected or not (r.written < oldest_allowed or left_bytes > limit):
+            continue
+        folder = paths.record_dir(r.run_id)
+        shutil.rmtree(folder, ignore_errors=True)
+        if folder.exists():
+            continue
+        removed.append(r)
+        left, left_bytes = left - 1, left_bytes - r.size
+    return Pruned(tuple(removed), left, left_bytes, left_bytes > limit)
+
+
+def one_component(run_id: str) -> bool:
+    return run_id not in ("", ".", "..") and "/" not in run_id and os.sep not in run_id
+
+
+def pin(run_id: str) -> None:
+    if not one_component(run_id) or not paths.record_dir(run_id).is_dir():
+        raise LookupError(f"no record for run {run_id}")
+    run_store.pin_record(run_id)
+
+
+def unpin(run_id: str) -> None:
+    if not run_store.unpin_record(run_id):
+        raise LookupError(f"run {run_id} is not pinned")
+
+
+def store() -> dict:
+    records = stored()
+    oldest = records[0] if records else None
+    return {"bytes": sum(r.size for r in records), "runs_bytes": runs_bytes(), "records": len(records),
+            "oldest": {"run_id": oldest.run_id, "written": util.iso(datetime.fromtimestamp(oldest.written, UTC))}
+            if oldest else None,
+            "pins": len(run_store.record_pins())}
+
+
+def size_text(n: int) -> str:
+    if n >= GB:
+        return f"{n / GB:.2f} GB"
+    if n >= 10 ** 6:
+        return f"{n / 10 ** 6:.1f} MB"
+    if n >= 1000:
+        return f"{n / 1000:.1f} KB"
+    return util.count(n, "byte")
