@@ -987,7 +987,7 @@ The poller orders new candidates by the longest remaining downstream dependency 
 It uses queued ticket bodies and existing `Waits on` declarations without extra per-ticket API fetches for ranking.
 Approval, dependency, running-ticket and capacity checks still decide whether a candidate can start, and the existing cross-repo scheduling remains in place.
 
-## Layout
+## Repository layout
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
