@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1216,7 +1217,8 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     return status, summary, pr_url
 
 
-def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None) -> None:
+def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
+               *, echo_end: bool = True) -> None:
     if restarting and status in ("skipped", "noop") and not run.feedback:
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
@@ -1230,9 +1232,32 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
     pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
     end_line = f"done: {status} {pr_url or summary}"
-    run.log(end_line)
+    if echo_end:
+        run.log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
+
+
+def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *, committed: bool) -> int:
+    from . import launch_lease
+    from .store import db
+
+    slot.free()
+    if run_id:
+        try:
+            if not committed:
+                with db.one_read(timeout=0):
+                    committed = bool(run_store.run_get(run_id))
+            if committed:
+                try:
+                    launch_lease.registered(repo, tid)
+                finally:
+                    outcome = "stopped" if isinstance(error, Stopped) else "failed"
+                    with db.tx(timeout=0):
+                        run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
+        except (OSError, RuntimeError, sqlite3.Error):
+            pass  # The scheduled reaper settles abandoned registered runs.
+    return 2
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1246,7 +1271,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, pilot, zte
+    from . import flows, launch_lease, pilot, zte
+    from .store import db
     from .store import zte as zte_store
 
     adw, refusal = run_refusal(repo, script is not None)
@@ -1316,7 +1342,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
-        with slots.admitting():
+        with slots.admitting(wait=zte_grant is None) as admitting:
+            if not admitting:
+                print("could not start the reserved README task: slot admission is busy")
+                return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
@@ -1345,37 +1374,64 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                     only_step=only)
 
-            if zte_grant:
-                from . import launch_lease
-                from .store import db
+            def check_start_cutoff():
+                pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
 
+            def check_handoff():
+                check_start_cutoff()
+                pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped before the flow started")
+                check_start_cutoff()
+
+            @contextmanager
+            def handoff_io():
+                with ExitStack() as stack:
+                    if zte_grant:
+                        stack.enter_context(db.nonblocking_transactions(wall_deadline, check_handoff))
+                        stack.enter_context(run_lines.nonblocking_appends(check_handoff))
+                    yield
+
+            if zte_grant:
+                run_id = ""
+                committed = False
                 try:
-                    with util.lock(zte.INTERLOCK, wait=True):
-                        fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                    with util.lock(zte.INTERLOCK) as got_interlock:
+                        pilot.require(got_interlock, "ZTE run registration is interlocked")
+                        check_start_cutoff()
+                        with db.one_read(timeout=0):
+                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
                         pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
-                        with db.tx():
+                        readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
+                        check_start_cutoff()
+                        with db.tx(timeout=0, before_commit=check_start_cutoff):
+                            check_start_cutoff()
+                            pilot.require(zte.task_version(fresh_grant, readme_rule, "todo") == fresh_grant.data["task_version"],
+                                          "the reserved task was edited before ZTE launch")
+                            check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
-                        try:
-                            launch_lease.registered(repo.name, str(tid))
-                        except PermissionError:
-                            record.settle(run_id, "failed", summary="could not release the scheduled launch lease")
-                            raise
-                except (OSError, RuntimeError, ValueError) as error:
-                    print(f"could not start the reserved README task: {error}")
-                    slot.free()
-                    return 2
+                        committed = True
+                        launch_lease.registered(repo.name, str(tid))
+                        check_start_cutoff()
+                except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                    return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
+                      feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
                 **(script.run_fields if script else {}))
-            run.dir.mkdir(parents=True, exist_ok=True)
-            run_lines.write(run.id, "execution", path=run.path or "classic", protocol=1 if run.path == "orchestrate" else 0)
+            try:
+                with handoff_io():
+                    run.dir.mkdir(parents=True, exist_ok=True)
+                    run_lines.write(run.id, "execution", path=run.path or "classic",
+                                    protocol=1 if run.path == "orchestrate" else 0)
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                if not zte_grant:
+                    raise
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1391,18 +1447,45 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if done["status"] != "stopped":
                 run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
-        opening_waits(run_id, run.answering,
-                      "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid)))
-        if restarting:
-            run.log(f"restarting after run {earlier['id']} was interrupted")
-        flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
-                            script.again) if script else None)
+        try:
+            with handoff_io():
+                if zte_grant:
+                    with util.lock(zte.INTERLOCK) as got:
+                        pilot.require(got, "ZTE startup accounting is interlocked")
+                        check_handoff()
+                        with db.tx():
+                            passed_over = source_store.take_passed_over(repo.name, str(tid))
+                    check_handoff()
+                else:
+                    passed_over = "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid))
+                opening_waits(run_id, run.answering, passed_over)
+                if zte_grant:
+                    check_handoff()
+                if restarting:
+                    run.log(f"restarting after run {earlier['id']} was interrupted")
+                if zte_grant:
+                    check_handoff()
+                flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
+                                    script.again) if script else None)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            if not zte_grant:
+                raise
+            return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run and not run.alone:
                 insights_store.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
-        pr_url, passed = "", None
+        pr_url, passed, work_started = "", None, False
+
+        def check_work_log():
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
+            pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped")
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
+
+        def checkpoint_allowed():
+            return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
+
         try:
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
@@ -1411,43 +1494,72 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
             current = tk.get(tid) if fresh else None
-            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
-                                          wall_deadline=wall_deadline)
-            with run.budget.watching():
-                if not (flow and flow.refusal):
-                    run.budget.capture(current or tk.get(tid))
-                status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            with handoff_io():
+                run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                              wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
+                                              checkpoint_gate=checkpoint_allowed if zte_grant else None)
+            with run.budget.watching(admit=check_handoff if zte_grant else None,
+                                     work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
+                                     periodic=not zte_grant):
+                with handoff_io():
+                    if not (flow and flow.refusal):
+                        run.budget.capture(current or tk.get(tid))
+                with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    work_started = True
+                    status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            if zte_grant:
+                check_work_log()
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
             elif run.action_only:
                 passed = status == "step"
         except runlimits.Parked as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = park_run(run, str(e))
-        except factory.OnlyDone:
+        except factory.OnlyDone as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary = "failed", str(e)
-        except Stopped:
+        except Stopped as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
         except workspace.RunFailed as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except tracker.ERRORS as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace:
+            if run.workspace and not zte_grant:
                 keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
-        settle_run(run, status, summary, pr_url, restarting, flow)
-        if status == "skipped":
+        try:
+            with handoff_io():
+                settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
+            if not zte_grant:
+                raise
+            return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+        if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
@@ -3220,6 +3332,15 @@ def retry_scratch(days: float = 30) -> None:
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
+    from . import zte
+
+    if zte.reserved(str(row["issue"])):
+        try:
+            with run_lines.nonblocking_appends(lambda: None):
+                run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        except (OSError, run_lines.AppendRefused):
+            pass
+        return
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
