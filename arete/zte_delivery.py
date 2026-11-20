@@ -1,49 +1,113 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+import fcntl
+import json
+import os
+import sqlite3
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, delegation, jev, launch_lease, pilot, record, scratch, util, workspace, zte
+from . import config, delegation, jev, launch_lease, paths, pilot, record, scratch, util, workspace, zte, zte_issue
 from .store import db, orchestration
 from .store import zte as store
 from .zte_github import GitHub, Identity
 
 INTENTS = {"push_intent", "pr_intent", "merge_intent"}
+JEV_STEP = "ZTE exact patch"
+JEV_USAGE_PENDING = paths.ZTE_AUTHORITY / "jev-response.pending"
 
 
-def settled(delivery, policy, repo, layer) -> bool:
+@contextmanager
+def deadline_snapshot(until: float, check):
+    check()
+    with db.one_read(timeout=0) as conn:
+        check()
+        conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
+        try:
+            yield
+        except sqlite3.OperationalError as error:
+            if error.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
+                check()
+            raise
+        finally:
+            conn.set_progress_handler(None, 0)
+    check()
+
+
+def settled(delivery, policy, repo, layer, *, until: float) -> bool:
+    with deadline_snapshot(until, lambda: pilot.candidate_time_left(until, 1)):
+        return validate_candidate(delivery, policy, repo, layer, until)
+
+
+def observe_startup(delivery, until: float) -> None:
+    def check():
+        pilot.require(time.monotonic() < until, "ZTE deadline expired while observing the scheduled startup")
+
+    check()
+    if delivery.phase == "dispatching":
+        leased = launch_lease.held(delivery.repo, delivery.task)
+        check()
+        if not leased:
+            with deadline_snapshot(until, check):
+                current = store.find(delivery.task)
+                check()
+                pilot.require(current != delivery, "the scheduled child exited before registration")
+    else:
+        with deadline_snapshot(until, check):
+            run = pilot.scheduled_run(delivery.repo, delivery.task, until=until)
+            check()
+            pilot.require(run and not run.get("finished"), "the run stopped before preparing an exact candidate")
+
+
+def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
+    def check():
+        pilot.candidate_time_left(until, 1)
+
+    def inactive(action):
+        check()
+        result = action["result"]
+        return not delegation.live(result.get("pid"), result.get("identity"))
+
     data = delivery.data
-    run = pilot.scheduled_run(delivery.repo, delivery.task)
+    run = pilot.scheduled_run(delivery.repo, delivery.task, until=until)
     if run and not run.get("finished"):
         return False
     pilot.require(run and (run["id"], run["status"]) == (data["run"], "pr"),
                   "the original run did not settle an exact candidate")
+    check()
     row = orchestration.find(run["id"])
     pilot.require(row and row["root"] == row["current_run"] == run["id"] and row["generation"] == 1,
                   "the original run generation changed")
+    check()
     if util.pid_alive(row["owner"]):
         return False
     lease = orchestration.Lease(run["id"], run["id"], 1)
+    check()
     actions = orchestration.actions(lease)
     completed = [a for a in actions if a["op"] == "publication.request" and a["state"] == "succeeded"]
+    check()
     pilot.require(not orchestration.pending(lease) and len(completed) == 1
                   and completed[0]["result"].get("prepared_head") == data["head"]
                   and all(a["state"] in ("succeeded", "failed", "cancelled") and a["op"] != "owner.ask"
-                          and not delegation.live(a["result"].get("pid"), a["result"].get("identity")) for a in actions),
-                  "the candidate has an unresolved or live producer")
+                          and inactive(a) for a in actions), "the candidate has an unresolved or live producer")
     checkout = zte.check_checkout(delivery, policy, repo, [workspace.Checkout.from_row(c)
-        for c in row["data"].get("prepared", {}).get("checkouts", [])])
+        for c in row["data"].get("prepared", {}).get("checkouts", [])], until=until)
     where = Path(data["worktree"])
-    pilot.require(checkout.wt == where and not scratch.pending(where), "the workspace or producer state changed")
+    pilot.require(checkout.wt == where and not scratch.pending(where, check=check),
+                  "the workspace or producer state changed")
     signal = policy.signal(delivery.base)
-    pilot.require(zte.task_version(delivery, signal, "pr") == data["pr_task_version"],
+    pilot.require(zte.task_version(delivery, signal, "pr", until=until) == data["pr_task_version"],
                   "the ZTE task changed after candidate preparation")
-    pilot.require(pilot.git(where, "rev-parse", "HEAD").strip() == data["head"]
-                  and pilot.exact_edit(where, signal, data["head"], signal.expected(pilot.readme(where, signal.base)))
-                  == data["tree"] and not pilot.git(where, "status", "--porcelain", "--untracked-files=all"),
+    pilot.require(pilot.git(where, "rev-parse", "HEAD", until=until).strip() == data["head"],
+                  "the exact ZTE candidate head changed after preparation")
+    expected = signal.expected(pilot.readme(where, signal.base, until=until))
+    pilot.require(pilot.exact_edit(where, signal, data["head"], expected, until=until) == data["tree"]
+                  and not pilot.git(where, "status", "--porcelain", "--untracked-files=all", until=until),
                   "the exact ZTE candidate changed after preparation")
+    check()
     pilot.require_evidence(row["data"], policy.identity.name, data["tree"], layer.checks)
     return True
 
@@ -77,6 +141,21 @@ def require_landing(delivery, client, expected: str = "", observed: dict | None 
     return {"release": landed, "merge_actor": pull["merged_by"]["id"], "merged_at": pull["merged_at"]}
 
 
+def require_issue_link(delivery, client, issue) -> None:
+    data = delivery.data
+    zte_issue.require_link(client.identity, issue, data["pr"], data["pr_node"], data["head"],
+                           client.issue_binding(issue.number, data["pr"]))
+
+
+def issue_closure(delivery, client):
+    data = delivery.data
+    if "issue" not in data:
+        return None
+    issue = zte_issue.Claim(**data["issue"])
+    return zte_issue.require_completed(client.identity, issue, data["pr"], data["pr_node"], data["head"],
+                                       data["release"], client.issue_binding(issue.number, data["pr"]))
+
+
 def settle_pr(delivery, client) -> None:
     data = delivery.data
     found = client.branch_prs(data["branch"])
@@ -89,7 +168,7 @@ def settle_pr(delivery, client) -> None:
                   "GitHub did not confirm the authorized fresh PR")
     returned = data.get("created_pr")
     pilot.require(not returned or returned == pull["node_id"], "GitHub returned another PR after creation")
-    with db.tx():
+    with db.tx(timeout=0):
         store.transition(delivery, "pr_ready", pr=pull["number"], pr_node=pull["node_id"], pr_url=pull["html_url"])
         record.note(data["run"], branch=data["branch"], pr_url=pull["html_url"])
 
@@ -113,23 +192,161 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
         proof = client.ci(head, tree, "pull_request", **ci_scope)
         if not proof or not ready_to_squash(delivery, client):
             return
+        deadline = zte.wall_deadline(delivery)
         pilot.require(jev.ready(cfg, [repo]), "JEV is unavailable for this exact patch")
-        patch = pilot.git(where, "diff", "--no-ext-diff", "--no-textconv", delivery.base, head)
+        remaining = deadline - time.monotonic()
+        pilot.require(remaining > 0, jev.DEADLINE_EXPIRED)
+        patch = util.git(["diff", "--no-ext-diff", "--no-textconv", delivery.base, head], where,
+                         timeout=min(remaining, 30), retry=False)
         pilot.require(patch, "the exact patch is not available to JEV")
-        result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, trace=(data["run"], "ZTE exact patch"))
-        pilot.require(not result.hold, result.hold)
-        risk = {**asdict(result), "patch": orchestration.digest(patch), "tree": tree, "head": head,
-                "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold,
-                "irreversible_hold": cfg.jev.irreversible_hold, "at": util.iso()}
+        delivery, risk = screen_patch(delivery, policy, cfg, patch, deadline)
+        if not reconcile_jev_usage(deadline=deadline):
+            return
+        check_jev_deadline(deadline)
         zte_release.preflight(delivery, policy)
     source = client.push_source(where, head, tree, delivery.base) if delivery.phase == "prepared" else nullcontext()
     with source as isolated:
         send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope)
 
 
+def screen_patch(delivery, policy, cfg, patch: str, deadline: float):
+    data = delivery.data
+    subject = {"patch": orchestration.digest(patch), "tree": data["tree"], "head": data["head"],
+               "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold, "irreversible_hold": cfg.jev.irreversible_hold}
+    if (receipt := data.get("jev_receipt")) is not None:
+        pilot.require(data.get("jev_attempt", {}).get("subject") == subject and not receipt["hold"]
+                      and all(receipt.get(key) == value for key, value in subject.items()),
+                      "the exact JEV receipt no longer matches the candidate")
+        return delivery, receipt
+    pilot.require("jev_attempt" not in data, "JEV attempt has no confirmed verdict; usage may be unknown, no retry")
+
+    def check_deadline():
+        check_jev_deadline(deadline)
+
+    try:
+        with util.lock(zte.INTERLOCK) as got:
+            pilot.require(got and not JEV_USAGE_PENDING.exists(), "JEV screening is busy or has pending usage")
+            with db.tx(timeout=0, before_commit=check_deadline):
+                check_stop(delivery, policy)
+                check_deadline()
+                delivery = store.annotate(delivery, jev_attempt={"subject": subject, "at": util.iso()})
+        with new_jev_journal(data["run"], deadline) as response, util.lock(zte.INTERLOCK) as got:
+            pilot.require(got, "the Stop interlock is busy before the JEV request")
+            with db.one_read(timeout=0):
+                check_stop(delivery, policy)
+            result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, deadline=deadline, receipt=response)
+    except jev.Unjudged as error:
+        raise pilot.Held(f"JEV could not judge the exact patch: {error}") from error
+    check_deadline()
+    pilot.require(not result.hold, result.hold)
+    receipt = {**asdict(result), **subject, "at": util.iso()}
+    with util.lock(zte.INTERLOCK) as got:
+        pilot.require(got, "the Stop interlock is busy after the JEV request")
+        with db.tx(timeout=0, before_commit=check_deadline):
+            check_stop(delivery, policy)
+            delivery = store.annotate(delivery, jev_receipt=receipt)
+    return delivery, receipt
+
+
+def check_jev_deadline(deadline: float) -> None:
+    pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
+
+
+def new_jev_journal(run: str, deadline: float):
+    path = JEV_USAGE_PENDING
+    with paths.directory_fd(path.parent) as parent:
+        launch_lease.private_directory(parent)
+        util.write_durably(path, json.dumps({"run": run}).encode() + b"\n", mode=0o600,
+                           before_replace=lambda: check_jev_deadline(deadline))
+        fd = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    journal = os.fdopen(fd, "r+b")
+    try:
+        pilot.require(launch_lease.plain(os.fstat(fd)), "unsafe JEV response journal")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        journal.seek(0, os.SEEK_END)
+        return journal
+    except BaseException:
+        journal.close()
+        raise
+
+
+def reconcile_jev_usage(*, deadline: float | None = None) -> bool:
+    path = JEV_USAGE_PENDING
+    try:
+        with paths.directory_fd(path.parent) as parent:
+            launch_lease.private_directory(parent)
+            fd = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    except FileNotFoundError:
+        return True
+    with os.fdopen(fd, "rb") as journal:
+        try:
+            # The transport inherits this file description. An orphaned curl may still be writing it.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        pilot.require(launch_lease.plain(os.fstat(fd)), "unsafe JEV response journal")
+        run = json.loads(journal.readline(512))["run"]
+        marker = journal.read(1)
+        pilot.require(marker in (b"", jev.REQUEST_ADMITTED), "invalid JEV response journal marker")
+        if not marker:
+            path.unlink()
+            util.flush_folder(path.parent)
+            return True
+        reply, seconds = jev.journal_reply(journal, jev.risk_questions())
+        usage = jev.result([reply])
+        usage.model = usage.model[:128].encode(errors="replace").decode()
+
+        def check_deadline():
+            if deadline is not None:
+                check_jev_deadline(deadline)
+
+        check_deadline()
+        util.flush_fd(fd)
+        check_deadline()
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline) as conn:
+                delivery = store.latest()
+                pilot.require(delivery and delivery.data.get("run") == run and "jev_attempt" in delivery.data,
+                              "JEV response journal has no matching delivery attempt")
+                if "jev_receipt" not in delivery.data and usage.ok:
+                    usage.ok = False
+                    usage.error = "provider usage recovered without an accepted JEV verdict"
+                prior = conn.execute("SELECT ok, model, cost_usd, tokens_in, error, seconds FROM steps "
+                                     "WHERE run_id=? AND step=? AND try=1", (run, JEV_STEP)).fetchone()
+                if prior is None:
+                    pilot.require(conn.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone(), "JEV usage has no run")
+                    record.step(run, JEV_STEP, usage, seconds, try_no=1)
+                else:
+                    pilot.require(tuple(prior) == (usage.ok, usage.model, usage.cost_usd, usage.tokens_in,
+                                                  usage.error, seconds), "JEV usage conflicts with a recorded step")
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
+            return False
+        check_deadline()
+        path.unlink()
+        util.flush_folder(path.parent)
+    return True
+
+
+def database_busy(error: sqlite3.OperationalError) -> bool:
+    return (getattr(error, "sqlite_errorcode", 0) & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+class HostedDeadlineExpired(pilot.Held):
+    pass
+
+
 def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -> None:
+    deadline = zte.wall_deadline(delivery)
+
+    def check_deadline():
+        if time.monotonic() >= deadline:
+            raise HostedDeadlineExpired("ZTE grant expired at the hosted write boundary")
+
     data = delivery.data
     branch, head, tree = data["branch"], data["head"], data["tree"]
+    check_deadline()
     token = client.token()
     policy.audit(client)
     if proof:
@@ -145,42 +362,84 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         pilot.require(delivery.phase == "pr_ready" and proof and risk, "no authorized ZTE squash")
         if not ready_to_squash(delivery, client):
             return
+    pr_body = policy.signal(delivery.base).task() if delivery.phase == "pushed" else ""
+    issue = policy.issue
+    if issue is not None:
+        pilot.require(data.get("issue") == asdict(issue), "the original GitHub issue claim changed")
+        if delivery.phase == "pr_ready":
+            require_issue_link(delivery, client, issue)
+        zte_issue.current(client, issue)
+    response = {}
     with util.lock(zte.INTERLOCK) as got:
         if not got:
             return
         pilot.require(zte.settings(config.load(), policy)[2] == data["config"], "ZTE configuration changed")
-        check_stop(delivery, policy)
-        if delivery.phase == "prepared":
-            store.transition(delivery, "push_intent", push_sent_after=util.iso())
+        check_deadline()
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline):
+                check_stop(delivery, policy)
+                sent = util.iso()
+                if delivery.phase == "prepared":
+                    intent = store.transition(delivery, "push_intent", push_sent_after=sent)
+                elif delivery.phase == "pushed":
+                    intent = store.transition(delivery, "pr_intent", pr_sent_after=sent)
+                else:
+                    intent = store.transition(delivery, "merge_intent", pr_ci=proof, risk=risk, merge_sent_after=sent)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
+            return
+        check_deadline()
+        if intent.phase == "push_intent":
             client.push(isolated, branch, head, token)
-        elif delivery.phase == "pushed":
-            intent = store.transition(delivery, "pr_intent", pr_sent_after=util.iso())
-            created = client.create(branch, pilot.TASK_TITLE, policy.signal(delivery.base).task(), token)
+        elif intent.phase == "pr_intent":
+            create_options = {"issue": issue} if issue is not None else {}
+            created = client.create(branch, pilot.TASK_TITLE, pr_body, token, **create_options)
             if isinstance(created.get("node_id"), str):
-                store.annotate(intent, created_pr=created["node_id"])
+                response["created_pr"] = created["node_id"]
         else:
-            intent = store.transition(delivery, "merge_intent", pr_ci=proof, risk=risk, merge_sent_after=util.iso())
             reply = client.squash(data["pr"], head, token)
             if reply.get("merged") is True and pilot.SHA.fullmatch(reply.get("sha") or ""):
-                store.annotate(intent, returned_merge=reply["sha"])
+                response["returned_merge"] = reply["sha"]
+
+    # A missing response hint leaves the committed intent for read-only reconciliation, not a resend.
+    if response and time.monotonic() < deadline:
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline):
+                store.annotate(intent, **response)
+        except HostedDeadlineExpired:
+            return
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
 
 
 def reconcile(delivery, client, observed: dict) -> None:
     if delivery.phase == "push_intent":
         pilot.require(client.branch_head(delivery.data["branch"]) == delivery.data["head"],
                       "the exact push effect is not observable; no retry")
-        store.transition(delivery, "pushed")
+        with db.tx(timeout=0):
+            store.transition(delivery, "pushed")
     elif delivery.phase == "pr_intent":
         settle_pr(delivery, client)
     else:
-        store.transition(delivery, "merged", **require_landing(delivery, client,
-                         expected=delivery.data.get("returned_merge", ""), observed=observed))
+        receipt = require_landing(delivery, client, expected=delivery.data.get("returned_merge", ""), observed=observed)
+        with db.tx(timeout=0):
+            store.transition(delivery, "merged", **receipt)
 
 
-def advance(cfg) -> None:
-    delivery = store.latest()
-    if not delivery or delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
-        return
+def advance(cfg) -> bool:
+    try:
+        with db.one_read(timeout=0):
+            delivery = store.latest()
+    except sqlite3.OperationalError as error:
+        if not database_busy(error):
+            raise
+        return False
+    if not delivery or delivery.phase == "healthy":
+        return True
+    if delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
+        return False
     observed: dict = {}
     if delivery.phase in INTENTS:
         timestamp = delivery.data[f"{delivery.phase.removesuffix('_intent')}_sent_after"]
@@ -190,44 +449,74 @@ def advance(cfg) -> None:
             client = GitHub(identity, util.iso(max(until, util.now() + timedelta(seconds=25))), Path("/dev/null"),
                             observer=zte.OBSERVER_FILE)
             reconcile(delivery, client, observed)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             if util.now() >= until or (observed.get("merged") and observed.get("target") != "main"):
-                zte.hold(delivery, error, uncertain=True, **({"observed_landing": observed} if observed else {}))
-        return
+                try:
+                    zte.hold(delivery, error, uncertain=True, timeout=0,
+                             **({"observed_landing": observed} if observed else {}))
+                except sqlite3.OperationalError as busy:
+                    if not database_busy(busy):
+                        raise
+        return False
+    until = None
+    startup = delivery.phase in ("dispatching", "running")
     try:
+        until = zte.wall_deadline(delivery)
         policy = zte.active(delivery)
         repo, layer, digest = zte.settings(cfg, policy)
         pilot.require(repo.name == delivery.repo and digest == delivery.data["config"], "ZTE configuration changed")
-        client = policy.client(delivery.deadline)
         if delivery.phase == "queued":
-            return
-        if delivery.phase == "dispatching":
-            if not launch_lease.held(delivery.repo, delivery.task):
-                pilot.require(store.find(delivery.task) != delivery, "the scheduled child exited before registration")
-            return
-        if delivery.phase == "running":
-            run = pilot.scheduled_run(delivery.repo, delivery.task)
-            pilot.require(run and not run.get("finished"), "the run stopped before preparing an exact candidate")
-            return
-        if not settled(delivery, policy, repo, layer):
-            return
+            pilot.require(time.monotonic() < until, "ZTE deadline expired while queued")
+            return False
+        if startup:
+            observe_startup(delivery, until)
+            return False
+        if not settled(delivery, policy, repo, layer, until=until):
+            return False
+        client = policy.client(delivery.deadline)
         if delivery.phase == "merged":
             policy.audit(client)
             release = delivery.data["release"]
             require_landing(delivery, client, release)
             proof = client.ci(release, delivery.data["tree"], "push")
             if proof:
-                store.transition(delivery, "release_ready", release_ci=proof)
+                closure = issue_closure(delivery, client)
+                closure_data = {"issue_closure": closure} if closure is not None else {}
+                with db.tx(timeout=0, before_commit=lambda: client.time_left()):
+                    check_stop(delivery, policy)
+                    store.transition(delivery, "release_ready", release_ci=proof, **closure_data)
         else:
             send_next(delivery, policy, client, cfg, repo)
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
-        current = store.find(delivery.task)
-        if current == delivery:
-            zte.hold(current, error)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+        if startup and until is not None and isinstance(error, sqlite3.OperationalError) and database_busy(error):
+            if time.monotonic() < until:
+                return False
+            error = pilot.Held("ZTE deadline expired while observing the scheduled startup")
+        try:
+            with db.one_read(timeout=0):
+                current = store.find(delivery.task)
+            if current == delivery or (current and delivery.phase == current.phase == "pr_ready"
+                                       and "jev_attempt" in current.data and current.data.get("run") == delivery.data["run"]):
+                zte.hold(current, error, timeout=0)
+        except sqlite3.OperationalError as busy:
+            if not database_busy(busy):
+                raise
+    return False
 
 
 def tick(cfg) -> None:
     with util.lock(zte.DELIVERY_LOCK) as got:
-        if got:
-            advance(cfg)
-    zte.finder(cfg)
+        if not got or not reconcile_jev_usage():
+            return
+        can_find = advance(cfg)
+        if not reconcile_jev_usage():
+            return
+    if can_find:
+        try:
+            zte.finder(cfg)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise

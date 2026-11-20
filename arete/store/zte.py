@@ -85,6 +85,12 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
         if previous and not (previous.phase == "healthy" and previous.policy == policy and previous.conformed and previous.base != base
                              and previous.conformed != base and previous.created[:10] != now[:10]):
             return None
+        if issue := data.get("issue"):
+            used = c.execute("SELECT 1 FROM zte_deliveries WHERE json_extract(data, '$.github.number') = ? "
+                             "AND json_extract(data, '$.issue.node') = ? LIMIT 1",
+                             (data["github"]["number"], issue["node"])).fetchone()
+            if used:
+                return None
         tid = "t-" + secrets.token_hex(20)
         tasks.task_add(repo, body, title=title, kind=kind, reserved_id=tid)
         c.execute("INSERT INTO zte_deliveries (task, policy, repo, base, created, deadline, phase, data) "

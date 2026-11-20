@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from . import alerts, codebase, config, launch_lease, loops, paths, pilot, principals, scratch, steps, util, workspace
+from . import alerts, codebase, config, launch_lease, loops, paths, pilot, principals, scratch, steps, util, workspace, zte_issue
 from .store import db, orchestration, runs, tasks
 from .store import zte as store
 from .zte_github import GitHub, Identity
@@ -51,10 +51,14 @@ class Policy:
     accept_target_race: bool
     github_audit: str
     rehearsal: bool
+    issue: zte_issue.Claim | None = None
 
     @property
     def fingerprint(self) -> str:
-        return orchestration.digest(asdict(self))
+        fields = asdict(self)
+        if self.issue is None:
+            del fields["issue"]
+        return orchestration.digest(fields)
 
     def client(self, deadline: str) -> GitHub:
         return GitHub(self.identity, deadline, paths.ZTE_AUTHORITY / "delivery.pem", observer=OBSERVER_FILE)
@@ -74,7 +78,8 @@ def load_policy() -> Policy | None:
         return None
     try:
         identity = Identity(**raw.pop("identity"))
-        policy = Policy(identity, **raw)
+        issue = zte_issue.Claim(**raw.pop("issue")) if "issue" in raw else None
+        policy = Policy(identity, issue=issue, **raw)
     except (KeyError, TypeError) as error:
         raise pilot.Held("invalid ZTE policy or identity fields") from error
     pilot.require(type(policy.rehearsal) is bool and type(policy.enabled) is bool
@@ -87,6 +92,11 @@ def load_policy() -> Policy | None:
                           for line in (policy.before, policy.after)) and policy.before != policy.after
                   and re.fullmatch(r"[a-f0-9]{64}", policy.github_audit) and pilot.SHA.fullmatch(identity.workflow_blob),
                   "invalid ZTE standing policy")
+    if issue is not None:
+        zte_issue.require_number(issue.number)
+        pilot.require(policy.rehearsal and type(issue.node) is str and 0 < len(issue.node) <= 128
+                      and type(issue.revision) is str and re.fullmatch(r"[a-f0-9]{64}", issue.revision),
+                      "issue-bound delivery is only available in the isolated rehearsal")
     return policy
 
 
@@ -125,12 +135,16 @@ def active(delivery: store.Delivery, *, engine: str = "") -> Policy:
     return policy
 
 
-def task_version(delivery: store.Delivery, signal: pilot.Signal, *states: str) -> int:
+def task_version(delivery: store.Delivery, signal: pilot.Signal, *states: str, until: float | None = None) -> int:
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
     task = tasks.task_get(delivery.task)
     pilot.require(task and task["repo"] == delivery.repo and task["title"] == pilot.TASK_TITLE
                   and task["kind"] == pilot.TASK_KIND and task["body"] == signal.task() and not task["parent"]
-                  and task["state"] in states
-                  and all(note["author"] == "arete" for note in tasks.task_comments(delivery.task)),
+                  and task["state"] in states, "the reserved ZTE task changed")
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    pilot.require(all(note["author"] == "arete" for note in tasks.task_comments(delivery.task)),
                   "the reserved ZTE task changed")
     return task["version"]
 
@@ -209,13 +223,20 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     return delivery, policy
 
 
-def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts) -> workspace.Checkout:
+def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts, *,
+                   until: float | None = None) -> workspace.Checkout:
     pilot.require(len(checkouts) == 1, "ZTE requires exactly one checkout")
     checkout = checkouts[0]
+    reason = "ZTE checkout does not match the approved origin"
     pilot.require(checkout.github == policy.identity.name and checkout.base == "main" and not checkout.dir
-                  and not any((checkout.pr, checkout.lease, checkout.resumes, checkout.merged_base))
-                  and checkout.src.resolve() == repo.path.resolve(), "ZTE checkout does not match the approved origin")
-    pilot.check_origin(checkout.wt, policy.identity.name)
+                  and not any((checkout.pr, checkout.lease, checkout.resumes, checkout.merged_base)), reason)
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    source = checkout.src.resolve()
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    pilot.require(source == repo.path.resolve(), reason)
+    pilot.check_origin(checkout.wt, policy.identity.name, until=until)
     return checkout
 
 
@@ -262,11 +283,14 @@ def observation(policy: Policy, repo: config.Repo, client: GitHub) -> tuple[str,
     return "no match", base
 
 
-def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False, **evidence) -> None:
+def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False,
+         timeout: float | None = None, **evidence) -> None:
     reason = util.first_line(str(error), 260) or type(error).__name__
+    reason_key = "hold_reason" if "reason" in delivery.data else "reason"
     try:
-        row = store.transition(delivery, "uncertain" if uncertain else "held", reason=reason, stopped_at=delivery.phase,
-                               **evidence)
+        with db.tx(timeout=timeout):
+            row = store.transition(delivery, "uncertain" if uncertain else "held", stopped_at=delivery.phase,
+                                   **{reason_key: reason, **evidence})
     except store.Conflict:
         return
     alerts.notify("Arete ZTE held", f"{row.task}: {reason}")
@@ -281,20 +305,26 @@ def finder(cfg: config.Config) -> None:
     with util.lock(DELIVERY_LOCK) as got:
         if not got:
             return
-        previous = store.latest()
+        with db.one_read(timeout=0):
+            previous = store.latest()
         if previous and previous.phase != "healthy":
             return
         repo, _, digest = settings(cfg, policy)
         deadline = util.iso(util.now() + timedelta(seconds=MAX_SECONDS))
         client = policy.client(deadline)
         status, base = observation(policy, repo, client)
+        if status == "eligible" and policy.issue is not None:
+            zte_issue.current(client, policy.issue)
         if status == "no match" or client.tip() != base:
             return
+        client.time_left()
         with util.lock(INTERLOCK) as got:
             if not got or PAUSE_FILE.exists() or load_policy() != policy or settings(config.load(), policy)[2] != digest:
                 return
+            client.time_left()
             if status == "conforming" and previous and previous.policy == policy.fingerprint:
-                store.note_conforming(previous, base)
+                with db.tx(timeout=0, before_commit=client.time_left):
+                    store.note_conforming(previous, base)
             elif status == "eligible":
                 from . import zte_release
 
@@ -303,10 +333,14 @@ def finder(cfg: config.Config) -> None:
                 if policy.rehearsal != profile["rehearsal"] or zte_release.selected(install) != base:
                     return
                 signal = policy.signal(base)
-                with principals.acting("rule:zte-finder"):
+                data = {"engine": codebase.STAMP, "config": digest, "task_version": 1,
+                        "github": asdict(policy.identity), "approved_installation": profile}
+                if policy.issue is not None:
+                    data["issue"] = asdict(policy.issue)
+                client.time_left()
+                with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,
-                                  signal.task(), {"engine": codebase.STAMP, "config": digest, "task_version": 1,
-                                                  "github": asdict(policy.identity), "approved_installation": profile})
+                                  signal.task(), data)
 
 
 def status(args) -> int:
