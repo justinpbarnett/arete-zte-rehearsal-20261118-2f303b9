@@ -2629,7 +2629,7 @@ Quota holds exit 75 without starting work or recording a result.
 Scheduler dispatch releases the claimed input and consults the persisted reset before trying again; a concurrent dispatch reports busy.
 Dry-run displays a quota hold without reserving.
 
-## Versioned writes
+## Versioned API writes
 
 Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
 A live duplicate is rejected while its request is in flight; keys are separate for each principal.
