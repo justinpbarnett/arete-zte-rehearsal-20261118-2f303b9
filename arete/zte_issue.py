@@ -28,6 +28,7 @@ query ($owner: String!, $repo: String!, $issue: Int!, $pr: Int!) {
             closer {
               __typename
               ... on PullRequest { id number mergeCommit { oid } }
+              ... on Commit { oid }
             }
           }
         }
@@ -94,10 +95,18 @@ def current(client: GitHub, claim: Claim) -> None:
                   "the approved GitHub issue revision changed")
 
 
-def pr_body(claim: Claim) -> gh.Outgoing:
+def closing_keyword(claim: Claim) -> str:
     require_number(claim.number)
-    link = f"Closes #{claim.number}"
-    return gh.outgoing("Verified one-line README correction.", link=link, mark=True)
+    return f"Closes #{claim.number}"
+
+
+def squash_title(pr_number: int) -> str:
+    require_number(pr_number)
+    return f"{pilot.TASK_TITLE} (#{pr_number})"
+
+
+def pr_body(claim: Claim) -> gh.Outgoing:
+    return gh.outgoing("Verified one-line README correction.", link=closing_keyword(claim), mark=True)
 
 
 def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict) -> tuple[dict, dict]:
@@ -140,11 +149,12 @@ def require_completed(identity: Identity, claim: Claim, pr_number: int, pr_node:
     events = (issue.get("timelineItems") or {}).get("nodes")
     pilot.require(isinstance(events, list) and len(events) == 1, "GitHub did not report the latest close or reopen event")
     event = events[0]
+    pull_closer = {"__typename": "PullRequest", "id": pr_node, "number": pr_number, "mergeCommit": {"oid": release}}
+    commit_closer = {"__typename": "Commit", "oid": release}
     pilot.require(event.get("__typename") == "ClosedEvent" and event.get("actor") == actor
-                  and event.get("closer") == {"__typename": "PullRequest", "id": pr_node,
-                                              "number": pr_number, "mergeCommit": {"oid": release}}
+                  and event.get("closer") in (pull_closer, commit_closer)
                   and event.get("createdAt") and util.parse_iso(event["createdAt"]) >= util.parse_iso(closed),
-                  "the latest issue close was not caused by the exact squash PR")
+                  "the latest issue close was not caused by the exact squash PR or its commit")
     return {"issue": claim.number, "issue_node": claim.node, "pr": pr_number, "pr_node": pr_node,
             "head": head, "release": release, "actor": identity.bot, "closed_at": closed,
             "closed_event_at": event["createdAt"]}
