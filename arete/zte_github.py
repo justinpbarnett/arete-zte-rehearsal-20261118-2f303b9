@@ -408,7 +408,11 @@ class GitHub:
         return api("POST", f"/{self.route}/pulls", token, self.time_left(),
                    {"head": branch, "base": "main", "title": str(gh.outgoing(title)), "body": str(body), "draft": False})
 
-    def squash(self, number: int, head: str, token: str) -> dict:
+    def squash(self, number: int, head: str, token: str, *, issue=None) -> dict:
         pilot.require(type(number) is int and number > 0 and pilot.SHA.fullmatch(head), "invalid squash request")
-        return api("PUT", f"/{self.route}/pulls/{number}/merge", token, self.time_left(),
-                   {"sha": head, "merge_method": "squash"})
+        fields = {"sha": head, "merge_method": "squash"}
+        if issue is not None:
+            from . import zte_issue
+
+            fields.update(commit_title=zte_issue.squash_title(number), commit_message=zte_issue.closing_keyword(issue))
+        return api("PUT", f"/{self.route}/pulls/{number}/merge", token, self.time_left(), fields)

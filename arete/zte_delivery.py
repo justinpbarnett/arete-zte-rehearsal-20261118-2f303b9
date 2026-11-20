@@ -138,6 +138,11 @@ def require_landing(delivery, client, expected: str = "", observed: dict | None 
     pilot.require(commit.get("tree", {}).get("sha") == data["tree"]
                   and [p["sha"] for p in commit["parents"]] == [delivery.base] and client.tip() == landed,
                   "the observed landing has a different parent, tree or current main")
+    if "issue" in data:
+        issue = zte_issue.Claim(**data["issue"])
+        message = f"{zte_issue.squash_title(data['pr'])}\n\n{zte_issue.closing_keyword(issue)}"
+        pilot.require((commit.get("commit") or {}).get("message") == message,
+                      "the observed squash does not carry the exact bound closing keyword")
     return {"release": landed, "merge_actor": pull["merged_by"]["id"], "merged_at": pull["merged_at"]}
 
 
@@ -398,7 +403,8 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
             if isinstance(created.get("node_id"), str):
                 response["created_pr"] = created["node_id"]
         else:
-            reply = client.squash(data["pr"], head, token)
+            squash_options = {"issue": issue} if issue is not None else {}
+            reply = client.squash(data["pr"], head, token, **squash_options)
             if reply.get("merged") is True and pilot.SHA.fullmatch(reply.get("sha") or ""):
                 response["returned_merge"] = reply["sha"]
 
