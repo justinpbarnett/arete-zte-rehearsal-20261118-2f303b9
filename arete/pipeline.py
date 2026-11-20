@@ -1257,6 +1257,7 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
                         run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
+    print(f"Could not register the reserved README task: {util.first_line(str(error), 240)}", flush=True)
     return 2
 
 
@@ -1402,7 +1403,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         with db.one_read(timeout=0):
                             fresh_grant = zte.admit_run(config.load(), repo, str(tid))
                         pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
-                        readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
+                        readme_rule = zte.active(fresh_grant).signal_for(fresh_grant)
                         check_start_cutoff()
                         with db.tx(timeout=0, before_commit=check_start_cutoff):
                             check_start_cutoff()

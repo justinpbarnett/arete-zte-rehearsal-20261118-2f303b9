@@ -1548,10 +1548,13 @@ def retain(a: Attempt) -> None:
 
 def recover_pending() -> list[str]:
     done = []
+    runs_dir = paths.RUNS_DIR.resolve()
     for data in records():
         if data["state"] == "done":
             continue
         a = Attempt(**data["attempt"])
+        if Path(a.run_dir).parent != runs_dir:
+            continue
         try:
             with registry() as (fd, _key):
                 try:
