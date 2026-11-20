@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -10,36 +11,32 @@ from . import gh, pilot, tracker, util
 if TYPE_CHECKING:
     from .zte_github import GitHub, Identity
 
-LABEL = "agent:zte"
+LABEL = tracker.ZTE_LABEL
 LABELS = frozenset({LABEL, "documentation"})
 MAX_BODY_BYTES = 16 * 1024
-CLOSING_QUERY = """
-query ($owner: String!, $repo: String!, $issue: Int!, $pr: Int!) {
-  repository(owner: $owner, name: $repo) {
-    databaseId id nameWithOwner owner { ...ActorId }
-    defaultBranchRef { name }
-    issue(number: $issue) {
-      id number state stateReason closedAt
-      blockedBy(first: 1) { totalCount }
-      subIssues(first: 1) { totalCount }
-      timelineItems(last: 1, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
-        nodes {
+HEADING_TITLE = "Rename a README heading"
+HEADING = re.compile(r"## [A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*\Z", re.ASCII)
+HEADING_BODY = re.compile(r"Before: ([^\n]+)\nAfter: ([^\n]+)\n?\Z")
+ISSUE_PROOF = """
+fragment RepositoryProof on Repository {
+  databaseId id nameWithOwner owner { ...ActorId }
+  defaultBranchRef { name }
+}
+fragment IssueProof on Issue {
+  id number state stateReason closedAt
+  blockedBy(first: 1) { totalCount }
+  subIssues(first: 1) { totalCount }
+  timelineItems(last: 1, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
+    nodes {
+      __typename
+      ... on ClosedEvent {
+        createdAt actor { ...ActorId }
+        closer {
           __typename
-          ... on ClosedEvent {
-            createdAt actor { ...ActorId }
-            closer {
-              __typename
-              ... on PullRequest { id number mergeCommit { oid } }
-              ... on Commit { oid }
-            }
-          }
+          ... on PullRequest { id number mergeCommit { oid } }
+          ... on Commit { oid }
         }
       }
-    }
-    pullRequest(number: $pr) {
-      id number body merged mergedAt mergedBy { ...ActorId }
-      baseRefName headRefOid mergeCommit { oid } isCrossRepository
-      closingIssuesReferences(first: 2) { totalCount nodes { id number } }
     }
   }
 }
@@ -48,6 +45,27 @@ fragment ActorId on Actor {
   ... on Bot { databaseId }
 }
 """
+ISSUE_QUERY = """
+query ($owner: String!, $repo: String!, $issue: Int!) {
+  repository(owner: $owner, name: $repo) {
+    ...RepositoryProof
+    issue(number: $issue) { ...IssueProof }
+  }
+}
+""" + ISSUE_PROOF
+CLOSING_QUERY = """
+query ($owner: String!, $repo: String!, $issue: Int!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    ...RepositoryProof
+    issue(number: $issue) { ...IssueProof }
+    pullRequest(number: $pr) {
+      id number body merged mergedAt mergedBy { ...ActorId }
+      baseRefName headRefOid mergeCommit { oid } isCrossRepository
+      closingIssuesReferences(first: 2) { totalCount nodes { id number } }
+    }
+  }
+}
+""" + ISSUE_PROOF
 
 
 @dataclass(frozen=True)
@@ -101,10 +119,35 @@ def admit(identity: Identity, number: int, row: dict) -> Claim:
     return Claim(number, row["node_id"], digest((*fields, updated)))
 
 
-def current(client: GitHub, claim: Claim) -> str:
+@dataclass(frozen=True)
+class HeadingEdit:
+    before: str
+    after: str
+
+    def __post_init__(self) -> None:
+        pilot.require(self.before != self.after and all(isinstance(line, str) and len(line) <= 96
+                      and HEADING.fullmatch(line) for line in (self.before, self.after)),
+                      "a standing issue requires two different plain-text README headings")
+
+
+def admit_heading(identity: Identity, number: int, row: dict) -> tuple[Claim, HeadingEdit]:
+    claim = admit(identity, number, row)
+    match = HEADING_BODY.fullmatch(row["body"])
+    pilot.require(row["title"] == HEADING_TITLE and match, "the issue is not a standing README heading request")
+    return claim, HeadingEdit(*match.groups())
+
+
+def current(client: GitHub, claim: Claim, *, require_fresh: bool = False,
+            heading: HeadingEdit | None = None) -> str:
     require_number(claim.number)
+    if require_fresh:
+        require_closable(require_issue(client.identity, claim, client.issue_snapshot(claim.number)))
     row = client.read(f"/issues/{claim.number}")
-    pilot.require(admit(client.identity, claim.number, row) == claim, "the approved GitHub issue revision changed")
+    if heading is None:
+        pilot.require(admit(client.identity, claim.number, row) == claim, "the approved GitHub issue revision changed")
+    else:
+        pilot.require(admit_heading(client.identity, claim.number, row) == (claim, heading),
+                      "the standing issue claim or approved heading edit changed")
     return digest(issue_content(client.identity, claim.number, row))
 
 
@@ -127,17 +170,23 @@ def pr_body(claim: Claim, *, explicit: bool = False) -> gh.Outgoing:
     return gh.outgoing("Verified one-line README correction.", link=reference(claim, explicit=explicit), mark=True)
 
 
-def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict, *,
-            explicit: bool = False) -> tuple[dict, dict]:
+def require_issue(identity: Identity, claim: Claim, repo: dict) -> dict:
     require_number(claim.number)
-    require_number(pr_number)
     pilot.require((repo.get("databaseId"), repo.get("id"), repo.get("nameWithOwner"))
                   == (identity.number, identity.node, identity.name)
                   and repo.get("owner") == {"databaseId": identity.owner}
                   and repo.get("defaultBranchRef") == {"name": "main"},
                   "GitHub did not return the approved repository and default branch")
-    issue, pull = repo.get("issue") or {}, repo.get("pullRequest") or {}
+    issue = repo.get("issue") or {}
     pilot.require((issue.get("number"), issue.get("id")) == (claim.number, claim.node), "the GitHub issue changed")
+    return issue
+
+
+def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict, *,
+            explicit: bool = False) -> tuple[dict, dict]:
+    require_number(pr_number)
+    issue = require_issue(identity, claim, repo)
+    pull = repo.get("pullRequest") or {}
     pilot.require((pull.get("number"), pull.get("id"), pull.get("headRefOid")) == (pr_number, pr_node, head)
                   and pull.get("baseRefName") == "main" and pull.get("isCrossRepository") is False,
                   "GitHub did not return the approved PR, head and branch")

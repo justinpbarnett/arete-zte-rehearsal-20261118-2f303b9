@@ -98,7 +98,7 @@ def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
     where = Path(data["worktree"])
     pilot.require(checkout.wt == where and not scratch.pending(where, check=check),
                   "the workspace or producer state changed")
-    signal = policy.signal(delivery.base)
+    signal = policy.signal_for(delivery)
     pilot.require(zte.task_version(delivery, signal, "pr", until=until) == data["pr_task_version"],
                   "the ZTE task changed after candidate preparation")
     pilot.require(pilot.git(where, "rev-parse", "HEAD", until=until).strip() == data["head"],
@@ -116,7 +116,7 @@ def check_stop(delivery, policy, *, engine: str = "") -> None:
     pilot.require(store.find(delivery.task) == delivery and zte.active(delivery, engine=engine) == policy,
                   "ZTE authority changed")
     pilot.require(not record.stop_asked(delivery.data["run"]), "the original run was stopped")
-    pilot.require(zte.task_version(delivery, policy.signal(delivery.base), "pr") == delivery.data["pr_task_version"],
+    pilot.require(zte.task_version(delivery, policy.signal_for(delivery), "pr") == delivery.data["pr_task_version"],
                   "the reserved task changed before an external effect")
 
 
@@ -159,7 +159,8 @@ def closable_issue(delivery, client) -> str:
                                                 data["release"], client.issue_binding(issue.number, data["pr"]),
                                                 explicit=True)
     zte_issue.require_closable(github_issue)
-    return zte_issue.current(client, issue)
+    heading = zte_issue.HeadingEdit(**data["heading_edit"]) if "heading_edit" in data else None
+    return zte_issue.current(client, issue, heading=heading)
 
 
 def issue_closure(delivery, client):
@@ -271,7 +272,7 @@ def screen_patch(delivery, policy, cfg, patch: str, deadline: float):
             pilot.require(got, "the Stop interlock is busy before the JEV request")
             with db.one_read(timeout=0):
                 check_stop(delivery, policy)
-            result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, deadline=deadline, receipt=response)
+            result = jev.risk(patch, policy.signal_for(delivery).task(), cfg, deadline=deadline, receipt=response)
     except jev.Unjudged as error:
         raise pilot.Held(f"JEV could not judge the exact patch: {error}") from error
     check_deadline()
@@ -399,13 +400,8 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         pilot.require(delivery.phase == "pr_ready" and proof and risk, "no authorized ZTE squash")
         if not ready_to_squash(delivery, client):
             return
-    pr_body = policy.signal(delivery.base).task() if delivery.phase == "pushed" else ""
-    issue = policy.issue
-    if issue is not None:
-        pilot.require(data.get("issue") == asdict(issue), "the original GitHub issue claim changed")
-        if delivery.phase == "pr_ready":
-            require_issue_link(delivery, client, issue)
-        zte_issue.current(client, issue)
+    pr_body = policy.signal_for(delivery).task() if delivery.phase == "pushed" else ""
+    issue = policy.claim_for(delivery)
     issue_options = {"issue": issue} if issue is not None else {}
     if policy.close_after_health:
         issue_options["explicit"] = True
@@ -415,6 +411,14 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
             return
         pilot.require(zte.settings(config.load(), policy)[2] == data["config"], "ZTE configuration changed")
         check_deadline()
+        if issue is not None:
+            with db.one_read(timeout=0):
+                check_stop(delivery, policy)
+            if delivery.phase == "pr_ready":
+                require_issue_link(delivery, client, issue)
+            zte_issue.current(client, issue, heading=policy.heading_for(delivery),
+                              require_fresh=bool((policy.production_issue_base or policy.standing_headings)
+                                                 and delivery.phase != "pr_ready"))
         try:
             with db.tx(timeout=0, before_commit=check_deadline):
                 check_stop(delivery, policy)
@@ -475,7 +479,7 @@ def advance(cfg) -> bool:
         if not database_busy(error):
             raise
         return False
-    if not delivery or delivery.phase == "healthy":
+    if not delivery or delivery.phase == "healthy" or store.pre_pr_hold(delivery):
         return True
     if delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
         return False
@@ -515,7 +519,7 @@ def advance(cfg) -> bool:
             return False
         if not settled(delivery, policy, repo, layer, until=until):
             return False
-        client = policy.client(delivery.deadline)
+        client = policy.client(delivery.deadline, delivery=delivery)
         if delivery.phase == "merged":
             policy.audit(client)
             release = delivery.data["release"]

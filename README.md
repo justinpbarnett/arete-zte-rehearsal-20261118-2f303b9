@@ -730,7 +730,7 @@ Run folders, including logs, evidence and continuation files, go after `lines_da
 Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
 Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
 
-## Database backups and restore
+## Backups
 
 ### Schema
 
@@ -987,7 +987,7 @@ The poller orders new candidates by the longest remaining downstream dependency 
 It uses queued ticket bodies and existing `Waits on` declarations without extra per-ticket API fetches for ranking.
 Approval, dependency, running-ticket and capacity checks still decide whether a candidate can start, and the existing cross-repo scheduling remains in place.
 
-## Repository layout
+## Layout
 
 - Code: this repo, a uv project (Python pinned in `.python-version`, everything locked in `uv.lock`). Installed with `uv tool install --editable . --python 3.13`
 - Config: `~/.config/arete/config.toml` (`arete init` writes a starting one)
@@ -1003,7 +1003,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Logs: `~/Library/Logs/arete/`. A log over 5 MB rotates by rename into five numbered copies (`runs.log.1` newest to `runs.log.5`), hourly by `arete serve`; `serve.log` rotates the same way when serve starts, including each restart for new code.
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
 
-## Local development
+## Develop locally
 
 `uv run arete status` runs from the checkout without the installed tool.
 `uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
@@ -1179,7 +1179,7 @@ A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for
 
 Poll picks local tasks in every `pipeline = true` repo that `arete run` would take, after the tracker's tickets, oldest first, replied tasks included, and a task whose wait still holds is skipped. A config whose repos all use `tracker = "local"` and have no `github` makes no network call when it polls. `POST /api/tasks` on the dashboard adds a task and starts it, or starts one that exists; see [API](#api).
 
-## Per-repository settings
+## Per repo layer
 
 ```toml
 [setup]
@@ -2462,7 +2462,47 @@ Explicit subscription calls contribute no paid spend and retain all their tokens
 
 ### API
 
-These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+The versioned interface is under `/api/v1`.
+Read `/api/v1/meta` for the API version, contract hash, server revision, and oldest supported clients.
+Read `/api/v1/contract` for the live registry or see the generated [OpenAPI document](docs/openapi.json) for this checkout.
+Legacy URLs keep their existing shapes and are tracked as deprecated aliases.
+
+#### Checking API changes
+
+Run these steps from the checkout after `uv sync` and `git fetch origin main`:
+
+1. Run `uv run arete api check`.
+   It starts an isolated loopback server on disposable state and exercises the registry, examples, keyed replay, stale writes, problem responses, CLI, MCP, streaming, response shapes, aliases, and reserved names.
+   It does not start or connect to the live dashboard or use external accounts.
+   The fixture gives Python only loopback networking and invokes Git with file-only transport and no inherited configuration or hooks.
+   It is a behavior check for trusted checkout code, not a sandbox for running arbitrary code.
+2. Run `uv run arete api diff` to compare against `origin/main`, or pass a commit or tag as the reference.
+   The command reads the reference's Git objects without importing its code and regenerates `docs/openapi.json` from the working registry.
+   Advance the API minor for a contract change and stage the generated file with the registry.
+   Run the same command again to confirm the artifact is deterministic.
+3. Run `uv run python docs/versioned-api-fixture.py exercise contract-evolution` to verify that an optional result addition passes after a minor bump, that removals and tighter inputs are diagnosed, and that each removal gate is enforced.
+   It uses a disposable clone; add `--root PATH` to keep its evidence in a new directory.
+4. Run `uv run python docs/versioned-api-fixture.py exercise nearby` to check legacy reads, keyed replays, and publication recovery.
+5. Optionally run `just hooks` to opt into the repository's pre-commit check.
+   It sets the repository's `core.hooksPath` to `.githooks` and refuses to replace a different hooks path or disable an active default hook.
+   The hook checks compatibility from the staged tree and refuses a commit when its generated OpenAPI document is missing or stale.
+   It does not rewrite the working tree.
+
+For a breaking change, the reference route must already be deprecated, its Sunset must have passed, and explicit evidence must show zero requests in the last seven days.
+Pass that evidence as `--usage FILE`, a JSON object keyed by `METHOD /path` with an explicit integer `requests` count and timezone-aware `from` and `through` timestamps covering the last seven days through the current minute.
+For a versioned GET operation, include a separate `batch_requests` count for calls through `POST /api/v1/batch` in the same window; the direct count alone is insufficient.
+The oldest supported client versions are fixed within v1.
+Pass `--owner-approval FILE` only for a recorded owner decision, with `approved: true`, the exact `base_commit` and candidate `contract_sha` printed by `api diff`, and the approved `routes` list.
+Missing usage or approval fails the check.
+For the opt-in hook, the corresponding file paths are `ARETE_API_USAGE` and `ARETE_API_OWNER_APPROVAL`.
+
+#### Route reference
+
+These routes pass the same caller check as the page, and a POST needs the `X-Arete: 1` header.
+A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+Send JSON bodies with `Content-Type: application/json` and a single `Content-Length`.
+Unkeyed legacy routes still accept an omitted media type, or no length for an empty body, but a supplied unsupported media type now returns 415.
+Evidence uploads still accept the supported image and video types or `application/octet-stream`.
 
 A chat's sessions have four routes: `GET /api/chats/N/sessions` lists them with the chat's limits (`max_sessions`, `running`, `budget_usd`, `spent`, `left`), `GET /api/chats/N/sessions/ID/report` returns a session's report, `POST /api/chats/N/sessions` starts one (body `prompt`, and optionally `repo`, `device`, `model`, `runner`, `budget_usd`; a missing `repo` means the chat's project), and `POST /api/chats/N/sessions/ID/stop` stops one. A session another chat started answers 404.
 
@@ -2601,12 +2641,20 @@ Successful run writes retain their legacy response bodies and identify the commi
 Every displayed run action sends its selected `base_version`.
 A stale action shows the conflict once, refreshes and sends no second POST; a deliberate action after refresh uses the new displayed version.
 
-The missing-version grace deadline starts inactive.
-Migration and startup never activate it.
-The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it persists activation plus 30 days, and repeated activation cannot extend it.
+Migration leaves the missing-version grace deadline inactive.
+Serving `/ui.html` for the first time activates the 30-day grace period.
+The deadline is persisted and does not move on later views or restarts.
 Before that deadline, legacy commands without versions work.
 At the exact deadline they return 409 `version_conflict` with the current persisted object.
 Explicit versions always compare; internal conditional writes remain versionless.
+
+`GET /api/v1/contract` lists the versioned operations with their inputs, result shapes, examples, and errors.
+`GET /api/v1/meta` reports the API version, engine and client versions, and contract hash.
+Legacy paths retain their existing fields and report `Deprecation: true`.
+Read results include a `seq` cursor and carry it in `Arete-Seq`; legacy writes keep their receipt in the header only.
+`POST /api/v1/batch` accepts up to 50 declared reads and evaluates them against one database snapshot.
+If dashboard fragments disagree, both dashboards refetch at most twice, keep the last coherent display if they still disagree, and try again on the next refresh.
+If a classic dashboard sidebar or questions request fails, the view can still refresh without showing the unavailable fragment as current.
 
 ## Rules
 

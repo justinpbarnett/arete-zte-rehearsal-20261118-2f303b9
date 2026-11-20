@@ -1319,6 +1319,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                               and layer.factory_path == ORCHESTRATED,
                               "the one-shot task requires the approved first scheduled orchestration")
                 wall_deadline = permit["deadline"]
+            if isinstance(tk, tracker.GitHubTracker):
+                tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
         except tracker.ERRORS as e:
@@ -2921,7 +2923,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         try:
             if zte_verify:
                 grant, policy = zte.for_run(run.repo, tid, run.id, "running")
-                signal = policy.signal(grant.base)
+                signal = policy.signal_for(grant)
             else:
                 signal = pilot.Signal(**pilot.live_receipt(tid, run.repo.name)["signal"])
             pilot.require(checked_trees.keys() == {""}, "the README verifier requires one exact candidate tree")

@@ -20,6 +20,8 @@ REHEARSAL = ("justinpbarnett/arete-zte-rehearsal-20261118-2f303b9", 1463520326, 
 POLICY_FILE = paths.ZTE_AUTHORITY / "zte.toml"
 OBSERVER_FILE = paths.ZTE_AUTHORITY / "observer.token"
 ISSUE_KEY = paths.ZTE_AUTHORITY / "issue-closer.pem"
+PRODUCTION_ISSUE_EDIT = ("## CI", "## Continuous integration")
+REHEARSAL_ISSUE_APP_ID = 5847973
 PAUSE_FILE = paths.ZTE_STOP
 INTERLOCK = "zte-interlock"
 DELIVERY_LOCK = "zte-delivery"
@@ -55,6 +57,11 @@ class Policy:
     issue: zte_issue.Claim | None = None
     close_after_health: bool = False
     issue_app: IssueApp | None = None
+    production_issue_base: str = ""
+    accept_issue_races: bool = False
+    reconciled_hold: str = ""
+    allow_same_day_recovery: bool = False
+    standing_headings: bool = False
 
     @property
     def fingerprint(self) -> str:
@@ -65,17 +72,62 @@ class Policy:
             del fields["close_after_health"]
         if self.issue_app is None:
             del fields["issue_app"]
+        if not self.production_issue_base:
+            del fields["production_issue_base"]
+        if not self.accept_issue_races:
+            del fields["accept_issue_races"]
+        if not self.reconciled_hold:
+            del fields["reconciled_hold"]
+        if not self.allow_same_day_recovery:
+            del fields["allow_same_day_recovery"]
+        if not self.standing_headings:
+            del fields["standing_headings"]
         return orchestration.digest(fields)
 
-    def client(self, deadline: str) -> GitHub:
-        return GitHub(self.identity, deadline, paths.ZTE_AUTHORITY / "delivery.pem", observer=OBSERVER_FILE)
+    def client(self, deadline: str, *, delivery: store.Delivery | None = None) -> GitHub:
+        claim = self.claim_for(delivery) if delivery is not None else self.issue
+        authority = None
+        if self.enabled and claim and self.issue_app and (
+                self.standing_headings or (self.production_issue_base and self.accept_issue_races)):
+            authority = claim, self.issue_app
+        key = Path("/dev/null") if self.standing_headings and delivery is None else paths.ZTE_AUTHORITY / "delivery.pem"
+        return GitHub(self.identity, deadline, key, observer=OBSERVER_FILE, issue_authority=authority)
+
+    def claim_for(self, delivery: store.Delivery) -> zte_issue.Claim | None:
+        data = delivery.data
+        claim = zte_issue.Claim(**data["issue"]) if self.standing_headings else self.issue
+        pilot.require(data.get("issue") == (asdict(claim) if claim is not None else None),
+                      "the original GitHub issue claim changed")
+        if self.standing_headings:
+            pilot.require(delivery.policy == self.fingerprint and data.get("github") == asdict(self.identity)
+                          and self.issue_app is not None and data.get("issue_app") == asdict(self.issue_app)
+                          and data.get("close_after_health") is True and claim is not None,
+                          "the standing issue lost its repository and separate App binding")
+            validate_claim(claim)
+        return claim
+
+    def heading_for(self, delivery: store.Delivery) -> zte_issue.HeadingEdit | None:
+        return zte_issue.HeadingEdit(**delivery.data["heading_edit"]) if self.standing_headings else None
 
     def signal(self, base: str) -> pilot.Signal:
+        pilot.require(not self.standing_headings, "a standing policy needs an admitted issue heading")
         return pilot.Signal(self.identity.name, base, self.before, self.after)
+
+    def signal_for(self, delivery: store.Delivery) -> pilot.Signal:
+        if heading := self.heading_for(delivery):
+            return pilot.Signal(self.identity.name, delivery.base, heading.before, heading.after)
+        return self.signal(delivery.base)
 
     def audit(self, client: GitHub) -> None:
         pilot.require(orchestration.digest(client.snapshot()) == self.github_audit,
                       "GitHub's visible writer or protection baseline changed")
+
+
+def validate_claim(issue: zte_issue.Claim) -> None:
+    zte_issue.require_number(issue.number)
+    pilot.require(type(issue.node) is str and 0 < len(issue.node) <= 128
+                  and type(issue.revision) is str and re.fullmatch(r"[a-f0-9]{64}", issue.revision),
+                  "invalid issue node or revision")
 
 
 def load_policy() -> Policy | None:
@@ -96,18 +148,42 @@ def load_policy() -> Policy | None:
                   and policy.accept_target_race is True and identity.bot != identity.owner
                   and all(type(v) is int and v > 0 for v in (identity.bot, identity.workflow, identity.app,
                                                             identity.installation))
-                  and all(isinstance(line, str) and line.startswith("## ") and 3 < len(line) <= 160 and line.isprintable()
-                          for line in (policy.before, policy.after)) and policy.before != policy.after
-                  and re.fullmatch(r"[a-f0-9]{64}", policy.github_audit) and pilot.SHA.fullmatch(identity.workflow_blob),
-                  "invalid ZTE standing policy")
+                  and type(policy.standing_headings) is bool and re.fullmatch(r"[a-f0-9]{64}", policy.github_audit)
+                  and pilot.SHA.fullmatch(identity.workflow_blob), "invalid ZTE policy")
+    if policy.standing_headings:
+        pilot.require(policy.rehearsal and issue is None and (policy.before, policy.after) == ("", "")
+                      and policy.close_after_health is True and issue_app is not None
+                      and issue_app.app == REHEARSAL_ISSUE_APP_ID
+                      and not any((policy.production_issue_base, policy.accept_issue_races, policy.reconciled_hold,
+                                   policy.allow_same_day_recovery)),
+                      "standing README issue admission is restricted to the disposable rehearsal")
+    else:
+        pilot.require(all(isinstance(line, str) and line.startswith("## ") and 3 < len(line) <= 160 and line.isprintable()
+                          for line in (policy.before, policy.after)) and policy.before != policy.after,
+                      "a pinned policy needs two different README headings")
     pilot.require(type(policy.close_after_health) is bool and policy.close_after_health == (issue_app is not None)
-                  and (issue_app is None or (policy.rehearsal and issue is not None and issue_app.separate_from(identity))),
-                  "closing an issue after release requires a separate App in an isolated issue-bound rehearsal")
+                  and (issue_app is None or (issue_app.separate_from(identity)
+                       and (issue is not None or policy.standing_headings))),
+                  "closing an issue after release requires a separate App and an admitted issue")
+    base = policy.production_issue_base
+    pilot.require(type(base) is str, "the production issue base must be an exact Git commit")
+    pilot.require(type(policy.accept_issue_races) is bool and (not policy.accept_issue_races or bool(base)),
+                  "issue race approval is specific to a pinned production delivery")
+    if base or (issue is not None and not policy.rehearsal):
+        pilot.require(not policy.rehearsal and issue is not None and issue_app is not None
+                      and issue_app.app != REHEARSAL_ISSUE_APP_ID and pilot.SHA.fullmatch(base)
+                      and (policy.before, policy.after) == PRODUCTION_ISSUE_EDIT,
+                      "production issue delivery requires the exact approved README edit, base and a distinct App")
+        pilot.require(not policy.enabled or policy.accept_issue_races,
+                      "production issue delivery requires separate approval of GitHub issue and PR metadata races")
+    pilot.require(type(policy.reconciled_hold) is str and (not policy.reconciled_hold
+                  or (base and policy.accept_issue_races and TASK.fullmatch(policy.reconciled_hold))),
+                  "a pre-PR hold may only be reconciled for an explicitly pinned production issue")
+    pilot.require(type(policy.allow_same_day_recovery) is bool
+                  and (not policy.allow_same_day_recovery or bool(policy.reconciled_hold)),
+                  "same-day recovery requires an explicitly pinned pre-PR hold")
     if issue is not None:
-        zte_issue.require_number(issue.number)
-        pilot.require(policy.rehearsal and type(issue.node) is str and 0 < len(issue.node) <= 128
-                      and type(issue.revision) is str and re.fullmatch(r"[a-f0-9]{64}", issue.revision),
-                      "issue-bound delivery is only available in the isolated rehearsal")
+        validate_claim(issue)
     return policy
 
 
@@ -120,6 +196,11 @@ def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.Re
     check = steps.resolve(cfg, layer, "verify", "fix")
     limits = layer.orchestration
     target = policy.identity.name
+    if (policy.production_issue_base or policy.standing_headings) and policy.issue_app:
+        pilot.require(cfg.github_app.app_id != str(policy.issue_app.app)
+                      and cfg.github_app.installation_id != str(policy.issue_app.installation)
+                      and (cfg.github_app.private_key is None or cfg.github_app.private_key.resolve() != ISSUE_KEY),
+                      "the issue App is reserved for the release supervisor")
     pilot.require(repo.github == target and repo.pipeline and len(repo.parts) == 1 and not repo.parts[0].dir
                   and repo.parts[0].github == target and repo.layer and layer.base_branch in ("", "main")
                   and layer.trust_level == "pr" and layer.factory_path == "orchestrated" and not cfg.replay.all
@@ -143,6 +224,14 @@ def active(delivery: store.Delivery, *, engine: str = "") -> Policy:
                   "ZTE policy was disabled, changed or stopped")
     pilot.require(util.now() < util.parse_iso(delivery.deadline) and (engine or codebase.STAMP) == delivery.data["engine"],
                   "ZTE deadline expired or its engine changed")
+    if policy.production_issue_base:
+        pilot.require(policy.production_issue_base == delivery.base == delivery.data.get("production_issue_base"),
+                      "the production issue base changed")
+    policy.claim_for(delivery)
+    if policy.standing_headings:
+        policy.signal_for(delivery)
+        pilot.require(delivery.data.get("approved_installation", {}).get("rehearsal") is True,
+                      "a standing issue is not bound to the rehearsal installation")
     return policy
 
 
@@ -196,7 +285,7 @@ def bind_launch(repo: str, tid: str, lease: launch_lease.Lease) -> None:
     pilot.require(poll_run and delivery and delivery.repo == repo and delivery.phase == "queued",
                   "ZTE task has no scheduled launch grant")
     policy = active(delivery)
-    pilot.require(task_version(delivery, policy.signal(delivery.base), "todo") == delivery.data["task_version"],
+    pilot.require(task_version(delivery, policy.signal_for(delivery), "todo") == delivery.data["task_version"],
                   "ZTE task was altered before dispatch")
     store.transition(delivery, "dispatching", dispatch=orchestration.digest(lease.message), scheduled_poll=poll_run)
 
@@ -211,14 +300,17 @@ def admit_run(cfg: config.Config, repo: config.Repo, tid: str) -> store.Delivery
     policy = active(delivery)
     current, _, digest = settings(cfg, policy)
     pilot.require(current == repo and digest == delivery.data["config"], "the admitted ZTE config changed")
-    pilot.require(task_version(delivery, policy.signal(delivery.base), "todo") == delivery.data["task_version"],
+    pilot.require(task_version(delivery, policy.signal_for(delivery), "todo") == delivery.data["task_version"],
                   "the reserved task was edited before ZTE launch")
     return delivery
 
 
 def require_launch_base(delivery: store.Delivery) -> None:
     policy = active(delivery)
-    pilot.require(policy.client(delivery.deadline).tip() == delivery.base, "protected main moved before ZTE launch")
+    client = policy.client(delivery.deadline, delivery=delivery)
+    pilot.require(client.tip() == delivery.base, "protected main moved before ZTE launch")
+    if policy.standing_headings:
+        zte_issue.current(client, policy.claim_for(delivery), require_fresh=True, heading=policy.heading_for(delivery))
 
 
 def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[store.Delivery, Policy]:
@@ -230,7 +322,7 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     pilot.require(current == repo and delivery.data["config"] == digest, "the admitted ZTE config changed")
     run = pilot.scheduled_run(repo.name, tid)
     pilot.require(run and run["id"] == run_id, "the ZTE run is not the original scheduled attempt")
-    task_version(delivery, policy.signal(delivery.base), "running", "pr")
+    task_version(delivery, policy.signal_for(delivery), "running", "pr")
     return delivery, policy
 
 
@@ -253,7 +345,7 @@ def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, 
 
 def prepare_candidate(run, job, evidence: dict) -> store.Delivery:
     delivery, policy = for_run(run.repo, str(run.tid), run.id, "running")
-    signal = policy.signal(delivery.base)
+    signal = policy.signal_for(delivery)
     checkout = check_checkout(delivery, policy, run.repo, job.checkouts)
     branch = job.branch
     where = checkout.wt
@@ -294,6 +386,33 @@ def observation(policy: Policy, repo: config.Repo, client: GitHub) -> tuple[str,
     return "no match", base
 
 
+def standing_finding(policy: Policy, repo: config.Repo, client: GitHub) -> tuple[str, zte_issue.Claim,
+                                                                               zte_issue.HeadingEdit] | None:
+    policy.audit(client)
+    pilot.check_origin(repo.path, policy.identity.name)
+    base = client.tip()
+    source = client.document(base)
+    for row in client.queued_issues():
+        if not isinstance(row, dict) or row.get("title") != zte_issue.HEADING_TITLE:
+            continue
+        try:
+            claim, heading = zte_issue.admit_heading(client.identity, row.get("number"), row)
+            validate_claim(claim)
+            signal = pilot.Signal(client.identity.name, base, heading.before, heading.after)
+            signal.expected(source)
+        except pilot.Held:
+            continue
+        with db.one_read(timeout=0):
+            if store.issue_used(client.identity.number, asdict(claim)):
+                continue
+        try:
+            zte_issue.current(client, claim, require_fresh=True, heading=heading)
+        except pilot.Held:
+            continue
+        return base, claim, heading
+    return None
+
+
 def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False,
          timeout: float | None = None, **evidence) -> None:
     reason = util.first_line(str(error), 260) or type(error).__name__
@@ -307,6 +426,18 @@ def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False,
     alerts.notify("Arete ZTE held", f"{row.task}: {reason}")
 
 
+def reconcile_pre_pr_hold(previous: store.Delivery, recovery: dict, client: GitHub, base: str) -> None:
+    pilot.require(client.branch_head(recovery["branch"]) == recovery["head"] and client.branch_prs(recovery["branch"]) == [],
+                  "the held branch no longer has its original head and no pull requests")
+    claim = zte_issue.Claim(**previous.data["issue"])
+    old = zte_issue.require_issue(client.identity, claim, client.issue_snapshot(claim.number))
+    zte_issue.require_closable(old)
+    comparison = client.read(f"/compare/{previous.base}...{base}")
+    pilot.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                  and comparison.get("merge_base_commit", {}).get("sha") == previous.base,
+                  "current protected main does not descend from the held attempt base")
+
+
 def finder(cfg: config.Config) -> None:
     if not POLICY_FILE.exists() or PAUSE_FILE.exists():
         return
@@ -318,16 +449,37 @@ def finder(cfg: config.Config) -> None:
             return
         with db.one_read(timeout=0):
             previous = store.latest()
+        recovery = None
         if previous and previous.phase != "healthy":
-            return
+            if (previous.task != policy.reconciled_hold or not (recovery := store.pre_pr_hold(previous))
+                    or not store.recovery_ready(previous, util.now(), allow_same_day=policy.allow_same_day_recovery)):
+                return
         repo, _, digest = settings(cfg, policy)
         deadline = util.iso(util.now() + timedelta(seconds=MAX_SECONDS))
         client = policy.client(deadline)
-        status, base = observation(policy, repo, client)
+        heading = None
+        claim = policy.issue
+        if policy.standing_headings:
+            if previous and (previous.policy != policy.fingerprint or previous.created[:10] == util.iso()[:10]):
+                return
+            finding = standing_finding(policy, repo, client)
+            if finding is None:
+                return
+            base, claim, heading = finding
+            status = "eligible"
+        else:
+            status, base = observation(policy, repo, client)
         if status == "eligible" and policy.issue is not None:
-            zte_issue.current(client, policy.issue)
+            if policy.production_issue_base and base != policy.production_issue_base:
+                return
+            zte_issue.current(client, policy.issue, require_fresh=bool(policy.production_issue_base))
             if policy.issue_app is not None:
                 client.require_issue_app(policy.issue_app, ISSUE_KEY)
+            if policy.reconciled_hold:
+                if not recovery or any(getattr(policy.issue, key) == previous.data["issue"][key]
+                                       for key in ("number", "node")):
+                    return
+                reconcile_pre_pr_hold(previous, recovery, client, base)
         if status == "no match" or client.tip() != base:
             return
         client.time_left()
@@ -345,13 +497,22 @@ def finder(cfg: config.Config) -> None:
                 profile = install.to_receipt()
                 if policy.rehearsal != profile["rehearsal"] or zte_release.selected(install) != base:
                     return
-                signal = policy.signal(base)
+                signal = (pilot.Signal(policy.identity.name, base, heading.before, heading.after)
+                          if heading is not None else policy.signal(base))
                 data = {"engine": codebase.STAMP, "config": digest, "task_version": 1,
                         "github": asdict(policy.identity), "approved_installation": profile}
-                if policy.issue is not None:
-                    data["issue"] = asdict(policy.issue)
+                if claim is not None:
+                    data["issue"] = asdict(claim)
+                if heading is not None:
+                    data["heading_edit"] = asdict(heading)
                 if policy.issue_app is not None:
                     data.update(close_after_health=True, issue_app=asdict(policy.issue_app))
+                if policy.production_issue_base:
+                    data["production_issue_base"] = policy.production_issue_base
+                if recovery:
+                    data["reconciled_hold"] = recovery
+                    if policy.allow_same_day_recovery:
+                        data["allow_same_day_recovery"] = True
                 client.time_left()
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,
@@ -368,8 +529,13 @@ def status(args) -> int:
         if args.dry_run and policy and policy.enabled and not paused:
             repo, _, _ = settings(config.load(), policy)
             client = policy.client(util.iso(util.now() + timedelta(seconds=MAX_SECONDS)))
-            found, tip = observation(policy, repo, client)
-            print(f"README rule: {found} at {tip}; no task or write requested")
+            if policy.standing_headings:
+                finding = standing_finding(policy, repo, client)
+                message = f"issue #{finding[1].number} at {finding[0]}" if finding is not None else "no matching issue"
+                print(f"Standing README rule: {message}; no task or write requested")
+            else:
+                found, tip = observation(policy, repo, client)
+                print(f"README rule: {found} at {tip}; no task or write requested")
     except (OSError, RuntimeError, ValueError, TypeError) as error:
         print(f"ZTE status unavailable: {util.first_line(str(error), 260)}")
         return 1

@@ -10,9 +10,13 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlencode
 
 from . import config, gh, pilot, util
+
+if TYPE_CHECKING:
+    from .zte_issue import Claim
 
 WORKFLOW = ".github/workflows/ci.yml"
 PERMISSIONS = {"contents": "write", "pull_requests": "write"}
@@ -129,9 +133,10 @@ class IssueApp:
 
 
 class GitHub:
-    def __init__(self, identity: Identity, deadline: str, key: Path, *, observer: Path | None = None):
+    def __init__(self, identity: Identity, deadline: str, key: Path, *, observer: Path | None = None,
+                 issue_authority: tuple[Claim, IssueApp] | None = None):
         self.identity, self.deadline, self.key = identity, deadline, key
-        self.observer = observer
+        self.observer, self.issue_authority = observer, issue_authority
         self.route = f"repos/{identity.name}"
 
     def time_left(self, cap: int = 15) -> float:
@@ -259,11 +264,30 @@ class GitHub:
     def issue_binding(self, number: int, pr: int) -> dict:
         from . import zte_issue
 
-        zte_issue.require_number(number)
         zte_issue.require_number(pr)
+        return self.issue_graph(zte_issue.CLOSING_QUERY, number, "-F", f"pr={pr}")
+
+    def queued_issues(self) -> list:
+        from . import zte_issue
+
+        query = urlencode({"state": "open", "labels": zte_issue.LABEL, "sort": "created", "direction": "desc",
+                           "per_page": 20})
+        found = self.read(f"/issues?{query}")
+        pilot.require(type(found) is list and len(found) <= 20, "invalid bounded standing issue listing")
+        return found
+
+    def issue_snapshot(self, number: int) -> dict:
+        from . import zte_issue
+
+        return self.issue_graph(zte_issue.ISSUE_QUERY, number)
+
+    def issue_graph(self, query: str, number: int, *args: str) -> dict:
+        from . import zte_issue
+
+        zte_issue.require_number(number)
         owner, name = self.identity.name.split("/")
-        reply = json.loads(self._gh_read(["graphql", "-f", f"query={zte_issue.CLOSING_QUERY}", "-f", f"owner={owner}",
-                                          "-f", f"repo={name}", "-F", f"issue={number}", "-F", f"pr={pr}"]))
+        reply = json.loads(self._gh_read(["graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+                                          "-f", f"repo={name}", "-F", f"issue={number}", *args]))
         pilot.require(not reply.get("errors") and isinstance((reply.get("data") or {}).get("repository"), dict),
                       "GitHub did not return complete issue closure evidence")
         return reply["data"]["repository"]
@@ -349,16 +373,37 @@ class GitHub:
         return self._issue_token(actor, key, write=True)
 
     def _issue_token(self, actor: IssueApp, key: Path, *, write: bool) -> str:
+        pilot.require(self.permits_issue_effect(actor=actor) and actor.separate_from(self.identity) and key != self.key,
+                      "issue closing requires the approved separate App for the pinned repository")
+        return self._installation_token(actor, key, ISSUE_PERMISSIONS, single_installation=True, write=write,
+                                        check_registration=self.issue_authority is not None)
+
+    def permits_issue_effect(self, *, actor: IssueApp | None = None, number: int | None = None) -> bool:
         from . import zte
 
         identity = self.identity
-        pilot.require((identity.name, identity.number, identity.node, identity.owner) == zte.REHEARSAL
-                      and actor.separate_from(identity) and key != self.key,
-                      "issue closing requires a separate App in the isolated rehearsal")
-        return self._installation_token(actor, key, ISSUE_PERMISSIONS, single_installation=True, write=write)
+        scope = identity.name, identity.number, identity.node, identity.owner
+        if self.issue_authority is None:
+            return scope == zte.REHEARSAL
+        if scope not in (zte.REHEARSAL, zte.CANONICAL):
+            return False
+        approved, approved_actor = self.issue_authority
+        return (approved_actor.separate_from(identity)
+                and (approved_actor.app == zte.REHEARSAL_ISSUE_APP_ID) == (scope == zte.REHEARSAL)
+                and (actor is None or actor == approved_actor) and (number is None or number == approved.number))
 
-    def _installation_token(self, actor: IssueApp, key: Path, permissions: dict, *,
-                            single_installation: bool = False, write: bool = True) -> str:
+    def require_issue_reference(self, claim: Claim, explicit: bool) -> None:
+        from . import zte
+
+        identity = self.identity
+        scope = identity.name, identity.number, identity.node, identity.owner
+        pilot.require((scope == zte.REHEARSAL and self.issue_authority is None)
+                      or (explicit and self.issue_authority is not None and self.permits_issue_effect(number=claim.number)
+                          and claim == self.issue_authority[0]),
+                      "the issue reference is outside the approved post-health close authority")
+
+    def _installation_token(self, actor: IssueApp, key: Path, permissions: dict, *, single_installation: bool = False,
+                            write: bool = True, check_registration: bool = False) -> str:
         import stat
 
         pilot.require(pilot.private(key.parent, stat.S_ISDIR) and pilot.private(key, stat.S_ISREG)
@@ -368,6 +413,12 @@ class GitHub:
         jwt = gh.app_jwt(app, timeout=self.time_left(30))
         path = f"/app/installations/{actor.installation}"
         allowed = {**permissions, "metadata": "read"}
+        if check_registration:
+            registration = api("GET", "/app", jwt, self.time_left())
+            pilot.require(registration.get("id") == actor.app and registration.get("public") is not True
+                          and (registration.get("owner") or {}).get("id") == identity.owner
+                          and registration.get("permissions") == allowed and registration.get("events") == [],
+                          "the issue App registration differs from the approved owner, scope or events")
         if single_installation:
             found = api("GET", "/app/installations?per_page=2", jwt, self.time_left(), result_type=list)
             pilot.require(len(found) == 1 and isinstance(found[0], dict), "the issue App must have exactly one installation")
@@ -452,6 +503,7 @@ class GitHub:
         if issue is not None:
             from . import zte_issue
 
+            self.require_issue_reference(issue, explicit)
             body = zte_issue.pr_body(issue, explicit=explicit)
         else:
             body = gh.outgoing(body, mark=True)
@@ -459,12 +511,10 @@ class GitHub:
                    {"head": branch, "base": "main", "title": str(gh.outgoing(title)), "body": str(body), "draft": False})
 
     def close_issue(self, number: int, token: str) -> None:
-        from . import zte, zte_issue
+        from . import zte_issue
 
-        identity = self.identity
-        pilot.require((identity.name, identity.number, identity.node, identity.owner) == zte.REHEARSAL,
-                      "issue closing is only available in the isolated rehearsal")
         zte_issue.require_number(number)
+        pilot.require(self.permits_issue_effect(number=number), "issue closure is outside the pinned authority")
         api("PATCH", f"/{self.route}/issues/{number}", token, self.time_left(),
             {"state": "closed", "state_reason": "completed"})
 
@@ -474,6 +524,7 @@ class GitHub:
         if issue is not None:
             from . import zte_issue
 
+            self.require_issue_reference(issue, explicit)
             fields.update(commit_title=zte_issue.squash_title(number),
                           commit_message=zte_issue.reference(issue, explicit=explicit))
         return api("PUT", f"/{self.route}/pulls/{number}/merge", token, self.time_left(), fields)
