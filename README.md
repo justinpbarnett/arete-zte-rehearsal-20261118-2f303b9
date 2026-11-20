@@ -730,7 +730,7 @@ Run folders, including logs, evidence and continuation files, go after `lines_da
 Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
 Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
 
-## Backups
+## Database backups and restore
 
 ### Schema
 
