@@ -1179,7 +1179,7 @@ A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for
 
 Poll picks local tasks in every `pipeline = true` repo that `arete run` would take, after the tracker's tickets, oldest first, replied tasks included, and a task whose wait still holds is skipped. A config whose repos all use `tracker = "local"` and have no `github` makes no network call when it polls. `POST /api/tasks` on the dashboard adds a task and starts it, or starts one that exists; see [API](#api).
 
-## Per repo layer
+## Per-repository settings
 
 ```toml
 [setup]
