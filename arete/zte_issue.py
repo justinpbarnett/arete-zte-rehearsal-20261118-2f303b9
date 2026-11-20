@@ -20,6 +20,8 @@ query ($owner: String!, $repo: String!, $issue: Int!, $pr: Int!) {
     defaultBranchRef { name }
     issue(number: $issue) {
       id number state stateReason closedAt
+      blockedBy(first: 1) { totalCount }
+      subIssues(first: 1) { totalCount }
       timelineItems(last: 1, itemTypes: [CLOSED_EVENT, REOPENED_EVENT]) {
         nodes {
           __typename
@@ -59,40 +61,51 @@ def require_number(value: int) -> None:
     pilot.require(type(value) is int and 0 < value < 2**31, "invalid GitHub issue or PR number")
 
 
-def admit(identity: Identity, number: int, row: dict) -> Claim:
+def issue_content(identity: Identity, number: int, row: dict) -> tuple:
     require_number(number)
     pilot.require(row.get("number") == number and "pull_request" not in row
                   and row.get("repository_url") == f"https://api.github.com/repos/{identity.name}"
                   and type(row.get("node_id")) is str and bool(row["node_id"])
                   and (row.get("user") or {}).get("id") == identity.owner,
                   "GitHub did not return the owner-authored issue in the approved repository")
-    pilot.require(row.get("state") == "open" and row.get("locked") is False and row.get("comments") == 0,
-                  "the issue is closed, locked, or has discussion outside its pinned revision")
+    pilot.require(row.get("locked") is False and row.get("comments") == 0,
+                  "the issue is locked or has discussion outside its pinned revision")
     raw_labels = row.get("labels")
     pilot.require(isinstance(raw_labels, list) and all(isinstance(label, dict)
                   and type(label.get("name")) is str for label in raw_labels), "GitHub did not return the issue labels")
     labels = sorted(label["name"] for label in raw_labels)
     pilot.require(LABEL in labels and set(labels) <= LABELS and len(set(labels)) == len(labels),
                   "the issue is not in the dedicated delivery queue")
-    title, body, updated = (row.get(key) for key in ("title", "body", "updated_at"))
+    title, body = (row.get(key) for key in ("title", "body"))
     pilot.require(type(title) is str and 0 < len(title.encode()) <= 512
-                  and type(body) is str and 0 < len(body.encode()) <= MAX_BODY_BYTES
-                  and type(updated) is str and len(updated) == 20 and updated.endswith("Z"),
-                  "the issue text or revision is missing or exceeds the delivery bound")
+                  and type(body) is str and 0 < len(body.encode()) <= MAX_BODY_BYTES,
+                  "the issue text is missing or exceeds the delivery bound")
+    pilot.require(not tracker.waits_on(body), "this lane does not admit issues with dependencies")
+    return identity.number, identity.node, identity.owner, number, row["node_id"], title, body, labels
+
+
+def digest(fields: tuple) -> str:
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+def admit(identity: Identity, number: int, row: dict) -> Claim:
+    fields = issue_content(identity, number, row)
+    updated = row.get("updated_at")
+    pilot.require(row.get("state") == "open", "the issue is not open")
+    pilot.require(type(updated) is str and len(updated) == 20 and updated.endswith("Z"),
+                  "the issue revision is missing or exceeds the delivery bound")
     try:
         util.parse_iso(updated)
     except ValueError as error:
         raise pilot.Held("GitHub returned an invalid issue timestamp") from error
-    pilot.require(not tracker.waits_on(body), "this lane does not admit issues with dependencies")
-    fields = (identity.number, identity.node, identity.owner, number, row["node_id"], title, body, labels, updated)
-    revision = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
-    return Claim(number, row["node_id"], revision)
+    return Claim(number, row["node_id"], digest((*fields, updated)))
 
 
-def current(client: GitHub, claim: Claim) -> None:
+def current(client: GitHub, claim: Claim) -> str:
     require_number(claim.number)
-    pilot.require(admit(client.identity, claim.number, client.read(f"/issues/{claim.number}")) == claim,
-                  "the approved GitHub issue revision changed")
+    row = client.read(f"/issues/{claim.number}")
+    pilot.require(admit(client.identity, claim.number, row) == claim, "the approved GitHub issue revision changed")
+    return digest(issue_content(client.identity, claim.number, row))
 
 
 def closing_keyword(claim: Claim) -> str:
@@ -105,11 +118,17 @@ def squash_title(pr_number: int) -> str:
     return f"{pilot.TASK_TITLE} (#{pr_number})"
 
 
-def pr_body(claim: Claim) -> gh.Outgoing:
-    return gh.outgoing("Verified one-line README correction.", link=closing_keyword(claim), mark=True)
+def reference(claim: Claim, *, explicit: bool = False) -> str:
+    require_number(claim.number)
+    return f"Approved issue: #{claim.number}" if explicit else closing_keyword(claim)
 
 
-def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict) -> tuple[dict, dict]:
+def pr_body(claim: Claim, *, explicit: bool = False) -> gh.Outgoing:
+    return gh.outgoing("Verified one-line README correction.", link=reference(claim, explicit=explicit), mark=True)
+
+
+def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict, *,
+            explicit: bool = False) -> tuple[dict, dict]:
     require_number(claim.number)
     require_number(pr_number)
     pilot.require((repo.get("databaseId"), repo.get("id"), repo.get("nameWithOwner"))
@@ -122,26 +141,48 @@ def binding(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head
     pilot.require((pull.get("number"), pull.get("id"), pull.get("headRefOid")) == (pr_number, pr_node, head)
                   and pull.get("baseRefName") == "main" and pull.get("isCrossRepository") is False,
                   "GitHub did not return the approved PR, head and branch")
-    pilot.require(pull.get("closingIssuesReferences") == {
-        "totalCount": 1, "nodes": [{"id": claim.node, "number": claim.number}],
-    }, "the PR does not close exactly the approved issue")
+    expected = [] if explicit else [{"id": claim.node, "number": claim.number}]
+    pilot.require(pull.get("closingIssuesReferences") == {"totalCount": len(expected), "nodes": expected},
+                  "the PR closing references differ from the approved issue policy")
     return issue, pull
 
 
-def require_link(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict) -> None:
-    issue, pull = binding(identity, claim, pr_number, pr_node, head, repo)
+def require_link(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, repo: dict, *,
+                 explicit: bool = False) -> None:
+    issue, pull = binding(identity, claim, pr_number, pr_node, head, repo, explicit=explicit)
     pilot.require(issue.get("state") == "OPEN" and pull.get("merged") is False
-                  and pull.get("body") == str(pr_body(claim)), "the pre-merge issue or exact PR body changed")
+                  and pull.get("body") == str(pr_body(claim, explicit=explicit)),
+                  "the pre-merge issue or exact PR body changed")
+    if explicit:
+        require_closable(issue)
+
+
+def require_merged(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, release: str,
+                   repo: dict, *, explicit: bool = False) -> tuple[dict, dict]:
+    issue, pull = binding(identity, claim, pr_number, pr_node, head, repo, explicit=explicit)
+    pilot.require(pull.get("merged") is True and pull.get("mergedBy") == {"databaseId": identity.bot}
+                  and pilot.SHA.fullmatch(release) and pull.get("mergeCommit") == {"oid": release}
+                  and pull.get("mergedAt") and pull.get("body") == str(pr_body(claim, explicit=explicit)),
+                  "GitHub did not report the approved squash and actor")
+    return issue, pull
+
+
+def require_closable(issue: dict) -> None:
+    pilot.require(issue.get("state") == "OPEN" and issue.get("closedAt") is None
+                  and issue.get("timelineItems") == {"nodes": []},
+                  "the issue no longer has a fresh open lifecycle")
+    require_no_dependencies(issue)
+
+
+def require_no_dependencies(issue: dict) -> None:
+    pilot.require(all(issue.get(field) == {"totalCount": 0} for field in ("blockedBy", "subIssues")),
+                  "GitHub did not confirm that the issue has no prerequisites or subissues")
 
 
 def require_completed(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, release: str,
-                      repo: dict) -> dict:
-    issue, pull = binding(identity, claim, pr_number, pr_node, head, repo)
+                      repo: dict, *, sent_after: str = "") -> dict:
+    issue, pull = require_merged(identity, claim, pr_number, pr_node, head, release, repo, explicit=bool(sent_after))
     actor = {"databaseId": identity.bot}
-    pilot.require(pull.get("merged") is True and pull.get("mergedBy") == actor and pilot.SHA.fullmatch(release)
-                  and pull.get("mergeCommit") == {"oid": release} and pull.get("mergedAt")
-                  and pull.get("body") == str(pr_body(claim)),
-                  "GitHub did not report the approved squash and actor")
     closed, merged = issue.get("closedAt"), pull["mergedAt"]
     pilot.require((issue.get("state"), issue.get("stateReason")) == ("CLOSED", "COMPLETED") and closed
                   and util.parse_iso(closed) >= util.parse_iso(merged),
@@ -152,9 +193,16 @@ def require_completed(identity: Identity, claim: Claim, pr_number: int, pr_node:
     pull_closer = {"__typename": "PullRequest", "id": pr_node, "number": pr_number, "mergeCommit": {"oid": release}}
     commit_closer = {"__typename": "Commit", "oid": release}
     pilot.require(event.get("__typename") == "ClosedEvent" and event.get("actor") == actor
-                  and event.get("closer") in (pull_closer, commit_closer)
                   and event.get("createdAt") and util.parse_iso(event["createdAt"]) >= util.parse_iso(closed),
-                  "the latest issue close was not caused by the exact squash PR or its commit")
+                  "the latest issue event is not the approved App's close")
+    if sent_after:
+        require_no_dependencies(issue)
+        pilot.require("closer" in event and event["closer"] is None
+                      and util.parse_iso(closed) >= util.parse_iso(sent_after),
+                      "the completed issue does not match the broker's close intent")
+    else:
+        pilot.require(event.get("closer") in (pull_closer, commit_closer),
+                      "the latest issue close was not caused by the exact squash PR or its commit")
     return {"issue": claim.number, "issue_node": claim.node, "pr": pr_number, "pr_node": pr_node,
             "head": head, "release": release, "actor": identity.bot, "closed_at": closed,
-            "closed_event_at": event["createdAt"]}
+            "closed_event_at": event["createdAt"], **({"close_sent_after": sent_after} if sent_after else {})}

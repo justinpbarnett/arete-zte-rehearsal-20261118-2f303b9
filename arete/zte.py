@@ -52,12 +52,15 @@ class Policy:
     github_audit: str
     rehearsal: bool
     issue: zte_issue.Claim | None = None
+    close_after_health: bool = False
 
     @property
     def fingerprint(self) -> str:
         fields = asdict(self)
         if self.issue is None:
             del fields["issue"]
+        if not self.close_after_health:
+            del fields["close_after_health"]
         return orchestration.digest(fields)
 
     def client(self, deadline: str) -> GitHub:
@@ -92,6 +95,9 @@ def load_policy() -> Policy | None:
                           for line in (policy.before, policy.after)) and policy.before != policy.after
                   and re.fullmatch(r"[a-f0-9]{64}", policy.github_audit) and pilot.SHA.fullmatch(identity.workflow_blob),
                   "invalid ZTE standing policy")
+    pilot.require(type(policy.close_after_health) is bool
+                  and (not policy.close_after_health or (policy.rehearsal and issue is not None)),
+                  "closing an issue after release requires an isolated issue-bound rehearsal")
     if issue is not None:
         zte_issue.require_number(issue.number)
         pilot.require(policy.rehearsal and type(issue.node) is str and 0 < len(issue.node) <= 128
@@ -337,6 +343,8 @@ def finder(cfg: config.Config) -> None:
                         "github": asdict(policy.identity), "approved_installation": profile}
                 if policy.issue is not None:
                     data["issue"] = asdict(policy.issue)
+                if policy.close_after_health:
+                    data["close_after_health"] = True
                 client.time_left()
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,

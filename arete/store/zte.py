@@ -62,12 +62,14 @@ def activation_pending() -> bool:
     with db.one_read() as c:
         if c.execute("PRAGMA user_version").fetchone()[0] < 12:
             return False
-        row = c.execute("SELECT phase, json_extract(data, '$.stopped_at') AS stopped_at "
+        row = c.execute("SELECT phase, json_extract(data, '$.stopped_at') AS stopped_at, "
+                        "json_extract(data, '$.completion_health') IS NOT NULL AS runtime_validated "
                         "FROM zte_deliveries ORDER BY rowid DESC LIMIT 1").fetchone()
         if not row:
             return False
         activating = {"deploy_intent", "rollback_intent"}
-        return row["phase"] in activating or (row["phase"] == "uncertain" and row["stopped_at"] in activating)
+        return not row["runtime_validated"] and (row["phase"] in activating
+               or (row["phase"] == "uncertain" and row["stopped_at"] in activating))
 
 
 def note_conforming(delivery: Delivery, observed_sha: str) -> None:
@@ -126,6 +128,9 @@ def amend(delivery: Delivery, phase: str, **data) -> Delivery:
 
 
 def complete(delivery: Delivery, task_version: int, **data) -> Delivery:
+    if delivery.data.get("close_after_health") and not (
+            delivery.data.get("issue_close_sent_after") and data.get("issue_closure")):
+        raise Conflict("the reserved issue has no observed completion")
     with db.tx():
         if not tasks.task_set_state(delivery.task, "done", from_states=("pr",), base_version=task_version):
             raise Conflict("ZTE task changed before its healthy release was recorded")

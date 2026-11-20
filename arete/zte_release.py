@@ -11,12 +11,12 @@ import sys
 import tempfile
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import alerts, codebase, config, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
+from . import alerts, codebase, config, gh, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
 from .store import db, runs
 from .store import zte as store
 
@@ -441,8 +441,7 @@ def deploy(install: Installation, delivery) -> None:
     pilot.require(install.to_receipt() == delivery.data["approved_installation"],
                   "the admitted managed release profile changed")
     zte_delivery.require_landing(delivery, client, sha)
-    pilot.require(zte_delivery.issue_closure(delivery, client) == delivery.data.get("issue_closure"),
-                  "GitHub issue closure changed before staging")
+    release_issue_gate(delivery, policy, client)
     stage(install, delivery, client)
     with db.one_read(timeout=activation_timeout(outer, 2)):
         if runs.runs_marked_running():
@@ -479,6 +478,15 @@ def deploy(install: Installation, delivery) -> None:
     finish(install, intent)
 
 
+def release_issue_gate(delivery, policy, client) -> None:
+    if policy.close_after_health:
+        pilot.require(zte_delivery.closable_issue(delivery, client) == delivery.data["issue_content"],
+                      "the approved issue changed before release")
+    else:
+        pilot.require(zte_delivery.issue_closure(delivery, client) == delivery.data.get("issue_closure"),
+                      "GitHub issue closure changed before release")
+
+
 def finish(install: Installation, delivery) -> None:
     data = delivery.data
     sha = data["release"]
@@ -492,8 +500,7 @@ def finish(install: Installation, delivery) -> None:
     policy = check()
     client = policy.client(util.iso(until))
     zte_delivery.require_landing(delivery, client, sha)
-    pilot.require(zte_delivery.issue_closure(delivery, client) == data.get("issue_closure"),
-                  "GitHub issue closure changed before release completion")
+    release_issue_gate(delivery, policy, client)
     final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"], until=until)
     with util.lock(zte.INTERLOCK) as got:
         if not got:
@@ -506,7 +513,85 @@ def finish(install: Installation, delivery) -> None:
             pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
                           "the validated runtime exited or restarted before completion")
             activation_time_left(until)
-            store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+            if policy.close_after_health:
+                store.annotate(delivery, release_health=beats, completion_health=final)
+            else:
+                store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+
+
+def close_after_health(install: Installation, delivery) -> None:
+    data = delivery.data
+    until = util.parse_iso(delivery.deadline)
+    policy = activation_authority(delivery, install, until)
+    pilot.require(policy.close_after_health and policy.rehearsal and policy.issue
+                  and data.get("close_after_health") is True and data["issue"] == asdict(policy.issue),
+                  "closing requires the original isolated issue authority")
+    client = policy.client(delivery.deadline)
+    token = client.token(close_only=True)
+    policy.audit(client)
+    zte_delivery.require_landing(delivery, client, data["release"])
+    pilot.require(client.ci(data["release"], data["tree"], "push") == data["release_ci"], "release CI evidence changed")
+    final = close_health(install, delivery, until)
+    release_issue_gate(delivery, policy, client)
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
+        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+            activation_authority(delivery, install, until)
+            pilot.require(selected(install) == data["release"] and util.pid_alive(final["pid"]),
+                          "the validated runtime exited or changed before issue closure")
+            activation_time_left(until)
+            intent = store.annotate(delivery, issue_close_sent_after=util.iso(), issue_close_health=final)
+        activation_authority(intent, install, until)
+        try:
+            client.close_issue(policy.issue.number, token)
+        except gh.GhUnsure as error:
+            activation_time_left(until)
+            with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+                store.annotate(intent, issue_close_transport=util.first_line(str(error), 160))
+
+
+def close_health(install: Installation, delivery, until: datetime) -> dict:
+    data = delivery.data
+    pilot.require(selected(install) == data["release"], "the validated release is no longer selected")
+    observation = health(install, data["release"], after=data["activation_after"], old_pid=data["old_pid"], until=until)
+    pilot.require(observation["pid"] == data["completion_health"]["pid"], "the validated runtime restarted")
+    return observation
+
+
+def reconcile_close(install: Installation, delivery) -> None:
+    from .zte_github import GitHub, Identity
+
+    data = delivery.data
+    cutoff = util.parse_iso(delivery.deadline)
+    observed_until = util.parse_iso(data["issue_close_sent_after"]) + timedelta(minutes=2)
+    client = GitHub(Identity(**data["github"]), util.iso(util.now() + timedelta(seconds=25)), Path("/dev/null"),
+                    observer=zte.OBSERVER_FILE)
+    try:
+        zte_delivery.require_landing(delivery, client, data["release"])
+        closure = zte_delivery.issue_closure(delivery, client)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        if util.now() >= observed_until:
+            if transport := data.get("issue_close_transport"):
+                error = pilot.Held(f"{transport}; {error}")
+            zte.hold(delivery, error, uncertain=True, timeout=0)
+        return
+    try:
+        activation_authority(delivery, install, cutoff)
+        final = close_health(install, delivery, cutoff)
+        with util.lock(zte.INTERLOCK) as got:
+            if not got:
+                return
+            with db.tx(timeout=0, before_commit=lambda: activation_time_left(cutoff)):
+                activation_authority(delivery, install, cutoff)
+                pilot.require(selected(install) == data["release"] and util.pid_alive(final["pid"]),
+                              "the validated runtime exited or changed before task completion")
+                store.complete(delivery, data["pr_task_version"], issue_closure=closure, issue_completion_health=final)
+    except sqlite3.OperationalError as error:
+        if not zte_delivery.database_busy(error):
+            raise
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        zte.hold(delivery, error, uncertain=True, timeout=0, observed_issue_closure=closure)
 
 
 def recovery_blocked(task: str) -> str:
@@ -545,11 +630,24 @@ def tick() -> int:
             if delivery.phase == "release_ready":
                 deploy(install, delivery)
             elif delivery.phase == "deploy_intent":
-                finish(install, delivery)
+                if delivery.data.get("issue_close_sent_after"):
+                    reconcile_close(install, delivery)
+                elif delivery.data.get("completion_health"):
+                    close_after_health(install, delivery)
+                else:
+                    finish(install, delivery)
             else:
                 restore(install, delivery)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
             current = store.find(delivery.task)
+            if current and current.phase == "deploy_intent" and current.data.get("completion_health"):
+                close_intent = current.data.get("issue_close_sent_after")
+                if close_intent and not delivery.data.get("issue_close_sent_after"):
+                    return 0
+                if isinstance(error, sqlite3.OperationalError) and zte_delivery.database_busy(error):
+                    return 0
+                zte.hold(current, error, uncertain=bool(close_intent), timeout=0)
+                return 1
             if current and current.phase == "deploy_intent":
                 try:
                     restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
