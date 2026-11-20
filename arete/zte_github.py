@@ -325,7 +325,7 @@ class GitHub:
         return {"run": run["id"], "attempt": run["run_attempt"], "check": expected[0]["id"],
                 "tested": tested[0], "event": event, "head": head, "tree": tree}
 
-    def token(self) -> str:
+    def token(self, *, close_only: bool = False) -> str:
         import stat
 
         pilot.require(pilot.private(self.key.parent, stat.S_ISDIR) and pilot.private(self.key, stat.S_ISREG)
@@ -348,10 +348,11 @@ class GitHub:
         bot = self.bot_info(login)
         pilot.require((bot.get("login"), bot.get("type"), bot.get("id")) == (login, "Bot", identity.bot),
                       "the delivery App bot does not match the approved actor")
+        requested = {"pull_requests": "write"} if close_only else PERMISSIONS
         reply = api("POST", f"{path}/access_tokens", jwt, self.time_left(),
-                    {"repository_ids": [identity.number], "permissions": PERMISSIONS})
+                    {"repository_ids": [identity.number], "permissions": requested})
         token = reply.get("token")
-        pilot.require(reply.get("permissions") == allowed and util.parse_iso(reply["expires_at"]) > util.now()
+        pilot.require(reply.get("permissions") == {**requested, "metadata": "read"} and util.parse_iso(reply["expires_at"]) > util.now()
                       and isinstance(token, str) and token, "the delivery App token permissions changed")
         scope = api("GET", "/installation/repositories?per_page=2", token, self.time_left())
         pilot.require(scope.get("total_count") == 1 and [(r["id"], r["node_id"], r["full_name"])
@@ -398,21 +399,32 @@ class GitHub:
         if result.returncode != 0:
             raise gh.GhUnsure("GitHub did not confirm the exact branch push; inspect without retrying")
 
-    def create(self, branch: str, title: str, body: str, token: str, *, issue=None) -> dict:
+    def create(self, branch: str, title: str, body: str, token: str, *, issue=None, explicit: bool = False) -> dict:
         if issue is not None:
             from . import zte_issue
 
-            body = zte_issue.pr_body(issue)
+            body = zte_issue.pr_body(issue, explicit=explicit)
         else:
             body = gh.outgoing(body, mark=True)
         return api("POST", f"/{self.route}/pulls", token, self.time_left(),
                    {"head": branch, "base": "main", "title": str(gh.outgoing(title)), "body": str(body), "draft": False})
 
-    def squash(self, number: int, head: str, token: str, *, issue=None) -> dict:
+    def close_issue(self, number: int, token: str) -> None:
+        from . import zte, zte_issue
+
+        identity = self.identity
+        pilot.require((identity.name, identity.number, identity.node, identity.owner) == zte.REHEARSAL,
+                      "issue closing is only available in the isolated rehearsal")
+        zte_issue.require_number(number)
+        api("PATCH", f"/{self.route}/issues/{number}", token, self.time_left(),
+            {"state": "closed", "state_reason": "completed"})
+
+    def squash(self, number: int, head: str, token: str, *, issue=None, explicit: bool = False) -> dict:
         pilot.require(type(number) is int and number > 0 and pilot.SHA.fullmatch(head), "invalid squash request")
         fields = {"sha": head, "merge_method": "squash"}
         if issue is not None:
             from . import zte_issue
 
-            fields.update(commit_title=zte_issue.squash_title(number), commit_message=zte_issue.closing_keyword(issue))
+            fields.update(commit_title=zte_issue.squash_title(number),
+                          commit_message=zte_issue.reference(issue, explicit=explicit))
         return api("PUT", f"/{self.route}/pulls/{number}/merge", token, self.time_left(), fields)
