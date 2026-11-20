@@ -12,13 +12,14 @@ from pathlib import Path
 from . import alerts, codebase, config, launch_lease, loops, paths, pilot, principals, scratch, steps, util, workspace, zte_issue
 from .store import db, orchestration, runs, tasks
 from .store import zte as store
-from .zte_github import GitHub, Identity
+from .zte_github import GitHub, Identity, IssueApp
 
 TASK = re.compile(r"t-[0-9a-f]{40}\Z")
 CANONICAL = ("justinpbarnett/arete", 1446501487, "R_kgDOVjfcbw", 42453910)
 REHEARSAL = ("justinpbarnett/arete-zte-rehearsal-20261118-2f303b9", 1463520326, "R_kgDOVzuMRg", 42453910)
 POLICY_FILE = paths.ZTE_AUTHORITY / "zte.toml"
 OBSERVER_FILE = paths.ZTE_AUTHORITY / "observer.token"
+ISSUE_KEY = paths.ZTE_AUTHORITY / "issue-closer.pem"
 PAUSE_FILE = paths.ZTE_STOP
 INTERLOCK = "zte-interlock"
 DELIVERY_LOCK = "zte-delivery"
@@ -53,6 +54,7 @@ class Policy:
     rehearsal: bool
     issue: zte_issue.Claim | None = None
     close_after_health: bool = False
+    issue_app: IssueApp | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -61,6 +63,8 @@ class Policy:
             del fields["issue"]
         if not self.close_after_health:
             del fields["close_after_health"]
+        if self.issue_app is None:
+            del fields["issue_app"]
         return orchestration.digest(fields)
 
     def client(self, deadline: str) -> GitHub:
@@ -82,7 +86,8 @@ def load_policy() -> Policy | None:
     try:
         identity = Identity(**raw.pop("identity"))
         issue = zte_issue.Claim(**raw.pop("issue")) if "issue" in raw else None
-        policy = Policy(identity, issue=issue, **raw)
+        issue_app = IssueApp(**raw.pop("issue_app")) if "issue_app" in raw else None
+        policy = Policy(identity, issue=issue, issue_app=issue_app, **raw)
     except (KeyError, TypeError) as error:
         raise pilot.Held("invalid ZTE policy or identity fields") from error
     pilot.require(type(policy.rehearsal) is bool and type(policy.enabled) is bool
@@ -95,9 +100,9 @@ def load_policy() -> Policy | None:
                           for line in (policy.before, policy.after)) and policy.before != policy.after
                   and re.fullmatch(r"[a-f0-9]{64}", policy.github_audit) and pilot.SHA.fullmatch(identity.workflow_blob),
                   "invalid ZTE standing policy")
-    pilot.require(type(policy.close_after_health) is bool
-                  and (not policy.close_after_health or (policy.rehearsal and issue is not None)),
-                  "closing an issue after release requires an isolated issue-bound rehearsal")
+    pilot.require(type(policy.close_after_health) is bool and policy.close_after_health == (issue_app is not None)
+                  and (issue_app is None or (policy.rehearsal and issue is not None and issue_app.separate_from(identity))),
+                  "closing an issue after release requires a separate App in an isolated issue-bound rehearsal")
     if issue is not None:
         zte_issue.require_number(issue.number)
         pilot.require(policy.rehearsal and type(issue.node) is str and 0 < len(issue.node) <= 128
@@ -321,6 +326,8 @@ def finder(cfg: config.Config) -> None:
         status, base = observation(policy, repo, client)
         if status == "eligible" and policy.issue is not None:
             zte_issue.current(client, policy.issue)
+            if policy.issue_app is not None:
+                client.require_issue_app(policy.issue_app, ISSUE_KEY)
         if status == "no match" or client.tip() != base:
             return
         client.time_left()
@@ -343,8 +350,8 @@ def finder(cfg: config.Config) -> None:
                         "github": asdict(policy.identity), "approved_installation": profile}
                 if policy.issue is not None:
                     data["issue"] = asdict(policy.issue)
-                if policy.close_after_health:
-                    data["close_after_health"] = True
+                if policy.issue_app is not None:
+                    data.update(close_after_health=True, issue_app=asdict(policy.issue_app))
                 client.time_left()
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,

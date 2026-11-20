@@ -168,13 +168,24 @@ def issue_closure(delivery, client):
         return None
     issue = zte_issue.Claim(**data["issue"])
     sent_after = data.get("issue_close_sent_after", "")
+    actor = None
+    if sent_after:
+        from .zte_github import IssueApp
+
+        identity = data.get("issue_app")
+        pilot.require(isinstance(identity, dict) and identity.keys() == {"app", "installation", "bot"},
+                      "the close intent does not bind the separate issue App; no send or adoption")
+        closer = IssueApp(**identity)
+        pilot.require(closer.separate_from(client.identity), "the issue close actor differs from the approved App")
+        actor = closer.bot
     proof = zte_issue.require_completed(client.identity, issue, data["pr"], data["pr_node"], data["head"],
-                                       data["release"], client.issue_binding(issue.number, data["pr"]), sent_after=sent_after)
+                                       data["release"], client.issue_binding(issue.number, data["pr"]),
+                                       sent_after=sent_after, close_actor=actor)
     if sent_after:
         row = client.read(f"/issues/{issue.number}")
         pilot.require((row.get("state"), row.get("state_reason"), row.get("closed_at")) ==
                       ("closed", "completed", proof["closed_at"])
-                      and (row.get("closed_by") or {}).get("id") == client.identity.bot
+                      and (row.get("closed_by") or {}).get("id") == actor
                       and zte_issue.digest(zte_issue.issue_content(client.identity, issue.number, row)) == data["issue_content"],
                       "the closed issue no longer matches the admitted issue and close actor")
     return proof
@@ -217,6 +228,8 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
         if not proof or not ready_to_squash(delivery, client):
             return
         deadline = zte.wall_deadline(delivery)
+        if policy.issue_app is not None:
+            client.require_issue_app(policy.issue_app, zte.ISSUE_KEY)
         pilot.require(jev.ready(cfg, [repo]), "JEV is unavailable for this exact patch")
         remaining = deadline - time.monotonic()
         pilot.require(remaining > 0, jev.DEADLINE_EXPIRED)

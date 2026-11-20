@@ -180,9 +180,12 @@ def require_no_dependencies(issue: dict) -> None:
 
 
 def require_completed(identity: Identity, claim: Claim, pr_number: int, pr_node: str, head: str, release: str,
-                      repo: dict, *, sent_after: str = "") -> dict:
+                      repo: dict, *, sent_after: str = "", close_actor: int | None = None) -> dict:
+    pilot.require((not sent_after and close_actor is None) or (sent_after and type(close_actor) is int
+                  and close_actor > 0 and close_actor not in (identity.bot, identity.owner)),
+                  "the issue close actor does not match the authorized mode")
     issue, pull = require_merged(identity, claim, pr_number, pr_node, head, release, repo, explicit=bool(sent_after))
-    actor = {"databaseId": identity.bot}
+    actor = {"databaseId": close_actor if sent_after else identity.bot}
     closed, merged = issue.get("closedAt"), pull["mergedAt"]
     pilot.require((issue.get("state"), issue.get("stateReason")) == ("CLOSED", "COMPLETED") and closed
                   and util.parse_iso(closed) >= util.parse_iso(merged),
@@ -204,5 +207,5 @@ def require_completed(identity: Identity, claim: Claim, pr_number: int, pr_node:
         pilot.require(event.get("closer") in (pull_closer, commit_closer),
                       "the latest issue close was not caused by the exact squash PR or its commit")
     return {"issue": claim.number, "issue_node": claim.node, "pr": pr_number, "pr_node": pr_node,
-            "head": head, "release": release, "actor": identity.bot, "closed_at": closed,
+            "head": head, "release": release, "actor": actor["databaseId"], "closed_at": closed,
             "closed_event_at": event["createdAt"], **({"close_sent_after": sent_after} if sent_after else {})}
