@@ -16,6 +16,7 @@ from . import config, gh, pilot, util
 
 WORKFLOW = ".github/workflows/ci.yml"
 PERMISSIONS = {"contents": "write", "pull_requests": "write"}
+ISSUE_PERMISSIONS = {"issues": "write"}
 LOG_TIME = r"[0-9.T:-]+Z "
 RUN_STEP = re.compile(rf"(?m)^{LOG_TIME}##\[group\]Run ([^\r\n]+)\r?$")
 CHECKOUT = re.compile(rf"(?m)^{LOG_TIME}\[command\][^\r\n]+/git log -1 --format=%H\r?\n"
@@ -26,7 +27,7 @@ MERGE_SETTINGS = """query($owner: String!, $name: String!) {
 MAX_RESPONSE = 1024 * 1024
 
 
-def api(method: str, path: str, token: str, timeout: float, data: dict | None = None) -> dict:
+def api(method: str, path: str, token: str, timeout: float, data: dict | None = None, *, result_type=dict):
     deadline = time.monotonic() + timeout
     pilot.require(path.startswith("/") and token.isascii() and token.isprintable(), "invalid ZTE API request")
     headers = (f"Authorization: Bearer {token}\nAccept: application/vnd.github+json\n"
@@ -54,7 +55,7 @@ def api(method: str, path: str, token: str, timeout: float, data: dict | None = 
         raise gh.GhUnsure(f"GitHub HTTP {label}; reconcile the ZTE effect by reading")
     pilot.require(len(raw) <= MAX_RESPONSE, "GitHub response exceeded the ZTE receipt bound")
     result = json.loads(raw)
-    pilot.require(isinstance(result, dict), "GitHub returned no ZTE receipt object")
+    pilot.require(isinstance(result, result_type), "GitHub returned an unexpected ZTE receipt")
     return result
 
 
@@ -113,6 +114,18 @@ class Identity:
     workflow_blob: str
     app: int
     installation: int
+
+
+@dataclass(frozen=True)
+class IssueApp:
+    app: int
+    installation: int
+    bot: int
+
+    def separate_from(self, identity: Identity) -> bool:
+        return (all(type(value) is int and value > 0 for value in (self.app, self.installation, self.bot))
+                and self.app != identity.app and self.installation != identity.installation
+                and self.bot not in (identity.bot, identity.owner))
 
 
 class GitHub:
@@ -325,40 +338,76 @@ class GitHub:
         return {"run": run["id"], "attempt": run["run_attempt"], "check": expected[0]["id"],
                 "tested": tested[0], "event": event, "head": head, "tree": tree}
 
-    def token(self, *, close_only: bool = False) -> str:
+    def token(self) -> str:
+        identity = self.identity
+        return self._installation_token(IssueApp(identity.app, identity.installation, identity.bot), self.key, PERMISSIONS)
+
+    def require_issue_app(self, actor: IssueApp, key: Path) -> None:
+        self._issue_token(actor, key, write=False)
+
+    def issue_token(self, actor: IssueApp, key: Path) -> str:
+        return self._issue_token(actor, key, write=True)
+
+    def _issue_token(self, actor: IssueApp, key: Path, *, write: bool) -> str:
+        from . import zte
+
+        identity = self.identity
+        pilot.require((identity.name, identity.number, identity.node, identity.owner) == zte.REHEARSAL
+                      and actor.separate_from(identity) and key != self.key,
+                      "issue closing requires a separate App in the isolated rehearsal")
+        return self._installation_token(actor, key, ISSUE_PERMISSIONS, single_installation=True, write=write)
+
+    def _installation_token(self, actor: IssueApp, key: Path, permissions: dict, *,
+                            single_installation: bool = False, write: bool = True) -> str:
         import stat
 
-        pilot.require(pilot.private(self.key.parent, stat.S_ISDIR) and pilot.private(self.key, stat.S_ISREG)
-                      and self.key.lstat().st_nlink == 1, "the delivery signing key must be private")
+        pilot.require(pilot.private(key.parent, stat.S_ISDIR) and pilot.private(key, stat.S_ISREG)
+                      and key.lstat().st_nlink == 1, "the App signing key must be private")
         identity = self.identity
-        app = config.GithubApp(app_id=str(identity.app), installation_id=str(identity.installation), private_key=self.key)
+        app = config.GithubApp(app_id=str(actor.app), installation_id=str(actor.installation), private_key=key)
         jwt = gh.app_jwt(app, timeout=self.time_left(30))
-        path = f"/app/installations/{identity.installation}"
-        install = api("GET", path, jwt, self.time_left())
-        allowed = {**PERMISSIONS, "metadata": "read"}
+        path = f"/app/installations/{actor.installation}"
+        allowed = {**permissions, "metadata": "read"}
+        if single_installation:
+            found = api("GET", "/app/installations?per_page=2", jwt, self.time_left(), result_type=list)
+            pilot.require(len(found) == 1 and isinstance(found[0], dict), "the issue App must have exactly one installation")
+            install = found[0]
+        else:
+            install = api("GET", path, jwt, self.time_left())
         pilot.require((install.get("id"), install.get("app_id"), install.get("target_id")) ==
-                      (identity.installation, identity.app, identity.owner) and install.get("target_type") == "User"
+                      (actor.installation, actor.app, identity.owner) and install.get("target_type") == "User"
                       and install.get("repository_selection") == "selected" and install.get("suspended_at") is None
-                      and install.get("permissions") == allowed,
-                      "the delivery App installation or permissions changed")
+                      and install.get("permissions") == allowed, "the App installation or permissions changed")
         slug = install.get("app_slug")
         pilot.require(isinstance(slug, str) and re.fullmatch(r"[a-z0-9-]{1,100}", slug),
-                      "the delivery App installation did not identify its bot")
+                      "the App installation did not identify its bot")
         login = slug + "[bot]"
         bot = self.bot_info(login)
-        pilot.require((bot.get("login"), bot.get("type"), bot.get("id")) == (login, "Bot", identity.bot),
-                      "the delivery App bot does not match the approved actor")
-        requested = {"pull_requests": "write"} if close_only else PERMISSIONS
-        reply = api("POST", f"{path}/access_tokens", jwt, self.time_left(),
-                    {"repository_ids": [identity.number], "permissions": requested})
+        pilot.require((bot.get("login"), bot.get("type"), bot.get("id")) == (login, "Bot", actor.bot),
+                      "the App bot does not match the approved actor")
+        if single_installation:
+            observer = self._mint_installation_token(path, jwt, {"metadata": "read"})
+            self._require_token_repository(observer)
+            if not write:
+                return observer
+        token = self._mint_installation_token(path, jwt, permissions, repository_ids=[identity.number])
+        self._require_token_repository(token)
+        return token
+
+    def _mint_installation_token(self, path: str, jwt: str, permissions: dict, **scope) -> str:
+        reply = api("POST", f"{path}/access_tokens", jwt, self.time_left(), {"permissions": permissions, **scope})
         token = reply.get("token")
-        pilot.require(reply.get("permissions") == {**requested, "metadata": "read"} and util.parse_iso(reply["expires_at"]) > util.now()
-                      and isinstance(token, str) and token, "the delivery App token permissions changed")
+        pilot.require(reply.get("permissions") == {**permissions, "metadata": "read"}
+                      and util.parse_iso(reply["expires_at"]) > util.now() and isinstance(token, str) and token,
+                      "the App token permissions changed")
+        return token
+
+    def _require_token_repository(self, token: str) -> None:
+        identity = self.identity
         scope = api("GET", "/installation/repositories?per_page=2", token, self.time_left())
         pilot.require(scope.get("total_count") == 1 and [(r["id"], r["node_id"], r["full_name"])
                       for r in scope.get("repositories", [])] == [(identity.number, identity.node, identity.name)],
-                      "the delivery App token did not prove the single approved repository")
-        return token
+                      "the App token did not prove the single approved repository")
 
     @staticmethod
     def git_env() -> dict:

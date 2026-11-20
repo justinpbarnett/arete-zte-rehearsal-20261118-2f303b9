@@ -523,11 +523,12 @@ def close_after_health(install: Installation, delivery) -> None:
     data = delivery.data
     until = util.parse_iso(delivery.deadline)
     policy = activation_authority(delivery, install, until)
-    pilot.require(policy.close_after_health and policy.rehearsal and policy.issue
-                  and data.get("close_after_health") is True and data["issue"] == asdict(policy.issue),
+    pilot.require(policy.close_after_health and policy.rehearsal and policy.issue and policy.issue_app
+                  and data.get("close_after_health") is True and data["issue"] == asdict(policy.issue)
+                  and data.get("issue_app") == asdict(policy.issue_app),
                   "closing requires the original isolated issue authority")
     client = policy.client(delivery.deadline)
-    token = client.token(close_only=True)
+    token = client.issue_token(policy.issue_app, zte.ISSUE_KEY)
     policy.audit(client)
     zte_delivery.require_landing(delivery, client, data["release"])
     pilot.require(client.ci(data["release"], data["tree"], "push") == data["release_ci"], "release CI evidence changed")
